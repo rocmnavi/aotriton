@@ -1,0 +1,6 @@
+filelock
+iniconfig
+packaging
+pluggy
+numpy
+setuptools
