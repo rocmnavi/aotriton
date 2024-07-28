@@ -31,7 +31,6 @@ SmallVector<unsigned> getRepShapeForCvtLayout(triton::gpu::ConvertLayoutOp op);
 template <typename T> class Interval {
 public:
   Interval() {}
-  Interval(T S) : Start(S), End(S+1) {}
   Interval(T S, T E) : Start(S), End(E) { assert(Start <= End); }
   T start() const { return Start; }
   T end() const { return End; }
@@ -46,16 +45,6 @@ public:
   bool operator!=(const Interval &R) const { return !(*this == R); }
   bool operator<(const Interval &R) const {
     return std::make_pair(Start, End) < std::make_pair(R.Start, R.End);
-  }
-  bool adjacent(T Addr) const {
-    return Addr+1 == Start || Addr == End;
-  }
-  bool adjacent(const Interval &R) const {
-    return adjacent(R.Start) || adjacent(R.End-1);
-  }
-
-  Interval merge(const Interval &R) const {
-    return Interval(std::min(Start, R.Start), std::max(End, R.End));
   }
 
 private:
@@ -149,7 +138,7 @@ public:
 private:
   /// A class that represents a shared memory buffer
   struct BufferT {
-    /// Explicit: triton_gpu.alloc_tensor
+    /// Explicit: triton_gpu.local_alloc
     /// Scratch: triton_gpu.convert_layout
     /// Virtual: triton.call
     enum class BufferKind { Explicit, Scratch, Virtual };
@@ -171,6 +160,10 @@ private:
             size_t offset = 0)
         : kind(kind), id(nextId++), size(size), alignment(alignment),
           offset(offset) {}
+
+    size_t setOffsetAligned(size_t newOffset) {
+      return offset = llvm::alignTo(newOffset, alignment);
+    }
   };
 
   /// Op -> Scratch Buffer

@@ -1,19 +1,18 @@
 #ifndef TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 #define TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_
 
-#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/SmallString.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include <algorithm>
+#include <numeric>
 
 namespace mlir {
 
 namespace triton {
+class ModuleAxisInfoAnalysis;
 class LoadOp;
 class StoreOp;
 class FuncOp;
@@ -24,19 +23,27 @@ class SharedEncodingAttr;
 
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
-                                                RankedTensorType type);
+                                                RankedTensorType type,
+                                                int numWarps);
 
-/// Returns true if the Load is for TMA
+/// Returns true if the Load uses block pointer.
 bool isLoadFromTensorPtr(triton::LoadOp op);
 
-/// Returns true if the store is for TMA
-bool isStoreToTensorPtr(triton::StoreOp op);
+// Return an array of indices enumerating the elements of 'arr' in descending
+// order (so that result[i] is the index of the i-th largest element of 'arr')
+SmallVector<unsigned, 4> argSort(const SmallVector<int64_t> &arr);
 
-/// Return the first consumer of v
-Operation *getFirstUser(Value v);
+// Return the operand used to access the memory in the operation
+Value getMemAccessPtr(Operation *op);
 
-/// Return the proper SharedEncodingAttr according to shape/order
-triton::gpu::SharedEncodingAttr getSharedEncoding(RankedTensorType tensorTy);
+// Return bitwidth of tensor element
+unsigned getElementBitWidth(RankedTensorType type);
+
+// Calculate the optimal number of elements per thread for a given operation
+// along an axis with greatest continuity.
+unsigned
+getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
+                        triton::ModuleAxisInfoAnalysis &axisInfoAnalysis);
 
 /* Dump Triton IR in graphviz dot format.
  *
@@ -115,9 +122,18 @@ bool isExpensiveLoadOrStore(Operation *op);
 bool canFoldIntoConversion(Operation *op, Attribute targetEncoding);
 
 // Replace ForOp with a new ForOp with extra operands. The YieldOp is not
-// updated and needs to be updated separatly for the loop to be correct.
-scf::ForOp replaceForOpWithNewSignature(OpBuilder &rewriter, scf::ForOp loop,
+// updated and needs to be updated separately for the loop to be correct.
+scf::ForOp replaceForOpWithNewSignature(
+    RewriterBase &rewriter, scf::ForOp loop, ValueRange newIterOperands,
+    SmallVectorImpl<std::tuple<Value, Value>> &replacements);
+scf::ForOp replaceForOpWithNewSignature(RewriterBase &rewriter, scf::ForOp loop,
                                         ValueRange newIterOperands);
+
+// Replace IfOp with a new IfOp with extra results operands. The YieldOp is not
+// updated and needs to be updated separately for the bodies to be correct.
+scf::IfOp replaceIfOpWithNewSignature(
+    RewriterBase &rewriter, scf::IfOp loop, TypeRange newResultTypes,
+    SmallVectorImpl<std::tuple<Value, Value>> &replacements);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);
@@ -149,82 +165,13 @@ Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
 Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
                 ArrayRef<unsigned> shape);
 
-enum class MfmaTypeId : uint32_t {
-  Fp32TyId = 0,
-  Fp16TyId,
-  Bf16TyId,
-  I8TyId,
-  Fp8Fp8TyId,
-  Fp8Bf8TyId,
-  Bf8Fp8TyId,
-  Bf8Bf8TyId
-};
+// Return true if the op is a pure elementwise_inline_asm op with a single
+// operand and single result.
+bool isPureUnaryInlineAsm(Operation *op);
 
-struct MfmaInsnGroupSelectKey {
-  unsigned mDim, nDim;
-  MfmaTypeId elemType;
-  int mfmaVersion;
-};
+// read the compute capability from the module attributes
+int getNVIDIAComputeCapability(Operation *module);
 
-struct MfmaInsnAttr {
-  // m,n,k refer to the shapes of the two operands of mfma instructions.
-  // Operand A has shape m x k. Operand B has shape k x n.
-  // For mfma32 and mfma16 instructions, they are the same as
-  // the dims in the instruction name, i.e. mfma_DType_mxnxkxABType
-  unsigned m;
-  unsigned n;
-  unsigned k;
-  // k_base refers to the number of elements per thread
-  unsigned k_base;
-  llvm::StringRef insn;
-};
-
-template <typename T>
-constexpr typename std::underlying_type<T>::type cast_as_underlying(T t) {
-  return static_cast<typename std::underlying_type<T>::type>(t);
-}
-
-struct MfmaInsnGroupSelectKeyInfo
-    : public llvm::DenseMapInfo<MfmaInsnGroupSelectKey> {
-  static inline MfmaInsnGroupSelectKey getEmptyKey() {
-    return {32, 32, MfmaTypeId::Fp32TyId, 0};
-  }
-
-  static inline MfmaInsnGroupSelectKey getTombstoneKey() {
-    return {32, 32, MfmaTypeId::Fp32TyId, -1};
-  }
-
-  static inline bool isEqual(const MfmaInsnGroupSelectKey &lhs,
-                             const MfmaInsnGroupSelectKey &rhs) {
-    return lhs.mDim == rhs.mDim && lhs.nDim == rhs.nDim &&
-           lhs.elemType == rhs.elemType && lhs.mfmaVersion == rhs.mfmaVersion;
-  }
-
-  static unsigned getHashValue(const MfmaInsnGroupSelectKey &key) {
-    auto dimHash = llvm::detail::combineHashValue(key.mDim, key.nDim);
-    auto verHash = llvm::detail::combineHashValue(dimHash, key.mfmaVersion);
-    auto elemHash = cast_as_underlying(key.elemType);
-    return llvm::detail::combineHashValue(elemHash, verHash);
-  }
-};
-
-class MfmaInsn {
-private:
-  Type elementTypeA;
-  Type elementTypeB;
-  MfmaInsnAttr attr;
-
-public:
-  static FailureOr<MfmaInsn> selectMfma(unsigned mDim, unsigned nDim,
-                                        Type elementTypeA, Type elementTypeB,
-                                        int mfmaVersion);
-  MfmaInsn(Type elementTypeA, Type elementTypeB, const MfmaInsnAttr &attr);
-  unsigned getKDim();
-  unsigned getMDim();
-  unsigned getNDim();
-  StringRef getInsnName();
-  unsigned getKBase();
-};
 } // namespace mlir
 
 #endif // TRITON_DIALECT_TRITONGPU_TRANSFORMS_UTILITY_H_

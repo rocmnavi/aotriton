@@ -1,52 +1,28 @@
-add_library(rocm_libraries SHARED IMPORTED )
-set_target_properties(rocm_libraries PROPERTIES IMPORTED_LOCATION ${ROCM_LIBRARIES})
-# Separate out PTX/GCN builders to avoid cyclic dependencies as TritonAnalysis
-# depends on it.
-set(LLVM_OPTIONAL_SOURCES
-    GCNAsmFormat.cpp
-    PTXAsmFormat.cpp
-  )
-
-add_mlir_conversion_library(TritonGPUToLLVM
+add_triton_library(TritonGPUToLLVM
     ConvertLayoutOpToLLVM/SharedToDotOperandFMA.cpp
-    ConvertLayoutOpToLLVM/SharedToDotOperandMMAv1.cpp
-    ConvertLayoutOpToLLVM/SharedToDotOperandMMAv2.cpp
-    ConvertLayoutOpToLLVM/SharedToDotOperandMFMA.cpp
-    ConvertLayoutOpToLLVM.cpp
     DotOpToLLVM/FMA.cpp
-    DotOpToLLVM/MMAv1.cpp
-    DotOpToLLVM/MMAv2.cpp
-    DotOpToLLVM/WGMMA.cpp
-    DotOpToLLVM/MFMA.cpp
-    DotOpToLLVM.cpp
-    ElementwiseOpToLLVM.cpp
-    LoadStoreOpToLLVM.cpp
-    BarrierOpToLLVM.cpp
-    TritonGPUToLLVM.cpp
-    GCNAsmFormat.cpp
-    PTXAsmFormat.cpp
-    TritonGPUToLLVMPass.cpp
-    ReduceOpToLLVM.cpp
-    ScanOpToLLVM.cpp
     TypeConverter.cpp
     Utility.cpp
+    ElementwiseOpToLLVM.cpp
+    MemoryOpToLLVM.cpp
+    AssertOpToLLVM.cpp
     ViewOpToLLVM.cpp
-    TensorPtrOpsToLLVM.cpp
-    ClusterOpsToLLVM.cpp
-    RegReallocOpToLLVM.cpp
-
-    ADDITIONAL_HEADER_DIRS
-    ${PROJECT_SOURCE_DIR}/include/triton/Conversion/TritonGPUToLLVM
-    ${PROJECT_BINARY_DIR}/include/triton/Conversion/TritonGPUToLLVM
+    MakeRangeOpToLLVM.cpp
+    HistogramOpToLLVM.cpp
+    AllocateSharedMemory.cpp
+    ReduceOpToLLVM.cpp
+    ScanOpToLLVM.cpp
+    ConvertLayoutOpToLLVM.cpp
+    ControlFlowOpToLLVM.cpp
+    FuncOpToLLVM.cpp
+    SPMDOpToLLVM.cpp
+    DecomposeUnsupportedConversions.cpp
+    PrintOpToLLVM.cpp
 
     DEPENDS
     TritonGPUConversionPassIncGen
 
-    LINK_COMPONENTS
-    Core
-
     LINK_LIBS PUBLIC
-    ASMBuilder
     MLIRIR
     MLIRPass
     MLIRGPUDialect
@@ -58,18 +34,4 @@ add_mlir_conversion_library(TritonGPUToLLVM
     TritonGPUIR
     TritonGPUTransforms
     TritonNvidiaGPUTransforms
-    NVGPUIR
-    rocm_libraries
-)
-
-add_mlir_library(ASMBuilder
-  GCNAsmFormat.cpp
-  PTXAsmFormat.cpp
-
-  DEPENDS
-  TritonTableGen
-
-  LINK_LIBS PUBLIC
-  MLIRAnalysis
-  MLIRLLVMDialect
 )

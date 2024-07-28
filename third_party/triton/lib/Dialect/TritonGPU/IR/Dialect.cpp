@@ -4,12 +4,19 @@
 
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Support/LLVM.h"
 #include "triton/Analysis/Utility.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.cpp.inc"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/StrUtil.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/TypeSwitch.h"
 
+// Include TableGen'erated code
+#include "triton/Dialect/TritonGPU/IR/Dialect.cpp.inc"
+
 using namespace mlir;
+using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
 // Utility
@@ -18,12 +25,12 @@ namespace triton {
 
 static Type getI1SameShapeFromTensorOrTensorPtr(Type type) {
   auto i1Type = IntegerType::get(type.getContext(), 1);
-  if (auto tensorType = type.dyn_cast<RankedTensorType>()) {
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
     return RankedTensorType::get(tensorType.getShape(), i1Type,
                                  tensorType.getEncoding());
-  } else if (auto ptrType = type.dyn_cast<triton::PointerType>()) {
+  } else if (auto ptrType = dyn_cast<triton::PointerType>(type)) {
     Type pointeeType = ptrType.getPointeeType();
-    if (auto tensorType = pointeeType.dyn_cast<RankedTensorType>()) {
+    if (auto tensorType = dyn_cast<RankedTensorType>(pointeeType)) {
       return RankedTensorType::get(tensorType.getShape(), i1Type,
                                    tensorType.getEncoding());
     }
@@ -39,34 +46,18 @@ namespace gpu {
 
 unsigned getTotalElemsPerThread(Attribute layout, ArrayRef<int64_t> shape,
                                 Type eltTy) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    return blockedLayout.getTotalElemsPerThread(shape, eltTy);
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    return sliceLayout.getTotalElemsPerThread(shape, eltTy);
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    return mmaLayout.getTotalElemsPerThread(shape, eltTy);
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    return mfmaLayout.getTotalElemsPerThread(shape, eltTy);
-  } else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
-    return sharedLayout.getTotalElemsPerThread(shape, eltTy);
-  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
-    return dotLayout.getTotalElemsPerThread(shape, eltTy);
+  if (auto tritonGPUAttr = mlir::dyn_cast<TritonGPU_AttrTrait>(layout)) {
+    return tritonGPUAttr.getTotalElemsPerThread(shape, eltTy);
   } else {
-    llvm::report_fatal_error("getElemsPerThread not implemented");
+    llvm::report_fatal_error("getTotalElemsPerThread not implemented");
     return 0;
   }
 }
 
 SmallVector<unsigned> getElemsPerThread(Attribute layout,
                                         ArrayRef<int64_t> shape, Type eltTy) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    return blockedLayout.getElemsPerThread(shape, eltTy);
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    return sliceLayout.getElemsPerThread(shape, eltTy);
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    return mmaLayout.getElemsPerThread(shape, eltTy);
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    return mfmaLayout.getElemsPerThread(shape, eltTy);
+  if (auto tritonGPUAttr = mlir::dyn_cast<TritonGPU_AttrTrait>(layout)) {
+    return tritonGPUAttr.getElemsPerThread(shape, eltTy);
   } else {
     llvm::report_fatal_error("getElemsPerThread not implemented");
     return SmallVector<unsigned>();
@@ -74,78 +65,28 @@ SmallVector<unsigned> getElemsPerThread(Attribute layout,
 }
 
 SmallVector<unsigned> getElemsPerThread(Type type) {
-  if (type.isIntOrIndexOrFloat() || type.isa<triton::PointerType>())
+  if (type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type))
     return SmallVector<unsigned>(1, 1);
-  auto tensorType = type.cast<RankedTensorType>();
+  auto tensorType = cast<RankedTensorType>(type);
   return getElemsPerThread(tensorType.getEncoding(), tensorType.getShape(),
                            tensorType.getElementType());
 }
 
 unsigned getTotalElemsPerThread(Type type) {
-  if (type.isIntOrIndexOrFloat() || type.isa<triton::PointerType>())
+  if (type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type))
     return 1;
-  auto tensorType = type.cast<RankedTensorType>();
+  auto tensorType = cast<RankedTensorType>(type);
   return getTotalElemsPerThread(tensorType.getEncoding(), tensorType.getShape(),
                                 tensorType.getElementType());
 }
 
 SmallVector<unsigned> getThreadsPerWarp(Attribute layout) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    return SmallVector<unsigned>(blockedLayout.getThreadsPerWarp().begin(),
-                                 blockedLayout.getThreadsPerWarp().end());
+  if (auto distributedLayout = dyn_cast<DistributedEncodingTrait>(layout)) {
+    return distributedLayout.getThreadsPerWarp();
+  } else {
+    llvm::report_fatal_error("getThreadsPerWarp not implemented");
+    return SmallVector<unsigned>();
   }
-  if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    if (mmaLayout.isVolta())
-      return {4, 8};
-    if (mmaLayout.isAmpere())
-      return {8, 4};
-    if (mmaLayout.isHopper())
-      return {8, 4};
-  }
-  if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    unsigned rows = -1, cols = -1;
-    unsigned mDim = mfmaLayout.getMDim();
-    unsigned nDim = mfmaLayout.getNDim();
-    if (mDim == nDim) {
-      if (mDim == 32) {
-        cols = 2;
-        rows = 32;
-      } else if (mDim == 16) {
-        cols = 4;
-        rows = 16;
-      } else if (mDim == 4) {
-        cols = 4;
-        rows = 16;
-      }
-    } else {
-      if (mDim == 64 && nDim == 4) {
-        cols = 16;
-        rows = 4;
-      } else if (mDim == 4 && nDim == 64) {
-        cols = 4;
-        rows = 16;
-      }
-    }
-
-    if (mfmaLayout.getIsTransposed()) {
-      return {rows, cols};
-    } else {
-      return {cols, rows};
-    }
-  }
-  if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    auto parent = sliceLayout.getParent();
-    auto parentThreadsPerWarp = getThreadsPerWarp(parent);
-    assert(parentThreadsPerWarp.size() == 2 &&
-           "getThreadsPerWarp only implemented for 2D slice layout");
-    SmallVector<unsigned> threadsPerWarp = parentThreadsPerWarp;
-    threadsPerWarp.erase(threadsPerWarp.begin() + sliceLayout.getDim());
-    for (unsigned i = 0; i < threadsPerWarp.size(); i++)
-      threadsPerWarp[i] *= parentThreadsPerWarp[sliceLayout.getDim()];
-    return threadsPerWarp;
-  }
-  llvm::report_fatal_error("getThreadsPerWarp not implemented");
-  return {};
 }
 
 unsigned getWarpSize(Attribute layout) {
@@ -160,7 +101,7 @@ unsigned getWarpSize(Attribute layout) {
 SmallVector<unsigned>
 getThreadsPerWarpWithUniqueData(Attribute layout,
                                 ArrayRef<int64_t> tensorShape) {
-  if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+  if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(layout)) {
     auto parentLayout = sliceLayout.getParent();
     auto parentShape = sliceLayout.paddedShape(tensorShape);
     auto parentThreadsPerWarp =
@@ -180,38 +121,18 @@ getThreadsPerWarpWithUniqueData(Attribute layout,
 }
 
 SmallVector<unsigned> getWarpsPerCTA(Attribute layout) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    return SmallVector<unsigned>(blockedLayout.getWarpsPerCTA().begin(),
-                                 blockedLayout.getWarpsPerCTA().end());
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    return distributedLayout.getWarpsPerCTA();
   }
-  if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    return SmallVector<unsigned>(mmaLayout.getWarpsPerCTA().begin(),
-                                 mmaLayout.getWarpsPerCTA().end());
-  }
-  if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    return SmallVector<unsigned>(mfmaLayout.getWarpsPerCTA().begin(),
-                                 mfmaLayout.getWarpsPerCTA().end());
-  }
-  if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    auto parent = sliceLayout.getParent();
-    auto parentWarpsPerCTA = getWarpsPerCTA(parent);
-    assert(parentWarpsPerCTA.size() == 2 ||
-           parentWarpsPerCTA[sliceLayout.getDim()] == 1 &&
-               "getWarpsPerCTA only implemented for 2D slice layout or the "
-               "slice dim must have 1 warp in the parent layout");
-    SmallVector<unsigned> warpsPerCTA = parentWarpsPerCTA;
-    warpsPerCTA.erase(warpsPerCTA.begin() + sliceLayout.getDim());
-    for (unsigned i = 0; i < warpsPerCTA.size(); i++)
-      warpsPerCTA[i] *= parentWarpsPerCTA[sliceLayout.getDim()];
-    return warpsPerCTA;
-  }
+
   llvm::report_fatal_error("getWarpsPerCTA not implemented");
-  return {};
+  return SmallVector<unsigned>();
 }
 
 SmallVector<unsigned>
 getWarpsPerCTAWithUniqueData(Attribute layout, ArrayRef<int64_t> tensorShape) {
-  if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+  if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(layout)) {
     auto parentLayout = sliceLayout.getParent();
     auto parentShape = sliceLayout.paddedShape(tensorShape);
     auto parentWarpsPerCTA =
@@ -234,83 +155,9 @@ getWarpsPerCTAWithUniqueData(Attribute layout, ArrayRef<int64_t> tensorShape) {
 }
 
 SmallVector<unsigned> getSizePerThread(Attribute layout) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    return SmallVector<unsigned>(blockedLayout.getSizePerThread().begin(),
-                                 blockedLayout.getSizePerThread().end());
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    auto sizePerThread = getSizePerThread(sliceLayout.getParent());
-    sizePerThread.erase(sizePerThread.begin() + sliceLayout.getDim());
-    return sizePerThread;
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    if (mmaLayout.isAmpere()) {
-      return {2, 2};
-    } else if (mmaLayout.isVolta()) {
-      return {1, 2};
-    } else if (mmaLayout.isHopper()) {
-      auto instrShape = mmaLayout.getInstrShape();
-      // TODO(thomas): what are those magic numbers?
-      return SmallVector<unsigned>{instrShape[0] * 4 / 32, instrShape[1] / 4};
-    } else {
-      llvm_unreachable("Unexpected mma version");
-    }
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    unsigned rows, cols;
-    unsigned mDim = mfmaLayout.getMDim();
-    unsigned nDim = mfmaLayout.getNDim();
-    assert((mDim == nDim && (mDim == 32 || mDim == 16 || mDim == 4)) ||
-           (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
-    switch (std::min(mDim, nDim)) {
-    case 32:
-      rows = 16;
-      cols = 1;
-      break;
-    case 16:
-      rows = 4;
-      cols = 1;
-      break;
-    case 4:
-      rows = 4;
-      cols = 1;
-      break;
-    default:
-      llvm_unreachable("Unexpected mfma non-k dim");
-    }
-    if (mfmaLayout.getIsTransposed()) {
-      return {cols, rows};
-    } else {
-      return {rows, cols};
-    }
-  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
-    auto parentLayout = dotLayout.getParent();
-    assert(parentLayout && "DotOperandEncodingAttr must have a parent");
-    if (auto parentMmaLayout = parentLayout.dyn_cast<MmaEncodingAttr>()) {
-      assert(parentMmaLayout.isAmpere() &&
-             "mmaLayout version = 1 is not implemented yet");
-      auto opIdx = dotLayout.getOpIdx();
-      if (opIdx == 0) {
-        return {2, 4};
-      } else if (opIdx == 1) {
-        return {4, 1};
-      } else {
-        llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
-        return {};
-      }
-    } else if (parentLayout.isa<MfmaEncodingAttr>()) {
-      auto opIdx = dotLayout.getOpIdx();
-      if (opIdx == 0) {
-        return {4, 1};
-      } else if (opIdx == 1) {
-        return {1, 4};
-      } else {
-        assert(0 && "DotOperandEncodingAttr opIdx must be 0 or 1");
-        return {};
-      }
-    } else {
-      llvm::report_fatal_error(
-          "DotOperandEncodingAttr non-MmaEncodingAttr parent not "
-          "supported yet");
-      return {};
-    }
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    return distributedLayout.getSizePerThread();
   } else {
     llvm::report_fatal_error("getSizePerThread not implemented");
     return {};
@@ -318,16 +165,11 @@ SmallVector<unsigned> getSizePerThread(Attribute layout) {
 }
 
 SmallVector<unsigned> getContigPerThread(Attribute layout) {
-  if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    assert(mmaLayout.isVolta() || mmaLayout.isAmpere() || mmaLayout.isHopper());
-    return {1, 2};
-  } else if (layout.isa<MfmaEncodingAttr>()) {
-    return {1, 1};
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    auto parentLayout = sliceLayout.getParent();
-    return getContigPerThread(parentLayout);
+  if (auto distributedLayout = dyn_cast<DistributedEncodingTrait>(layout)) {
+    return distributedLayout.getContigPerThread();
   } else {
-    return getSizePerThread(layout);
+    llvm::report_fatal_error("getContigPerThread not implemented");
+    return {};
   }
 }
 
@@ -335,7 +177,7 @@ SmallVector<unsigned> getUniqueContigPerThread(Attribute layout,
                                                ArrayRef<int64_t> shape) {
   // If slice layout, call recursively on parent layout, and drop
   // sliced dim
-  if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+  if (auto sliceLayout = mlir::dyn_cast<SliceEncodingAttr>(layout)) {
     auto parentLayout = sliceLayout.getParent();
     auto parentShape = sliceLayout.paddedShape(shape);
     auto parentUniqueContigPerThread =
@@ -355,127 +197,28 @@ SmallVector<unsigned> getUniqueContigPerThread(Attribute layout,
   return ret;
 }
 
-SmallVector<unsigned> getThreadsPerCTA(Attribute layout) {
-  SmallVector<unsigned> threads;
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    for (int d = 0, n = blockedLayout.getOrder().size(); d < n; ++d)
-      threads.push_back(blockedLayout.getThreadsPerWarp()[d] *
-                        blockedLayout.getWarpsPerCTA()[d]);
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    if (mmaLayout.isAmpere()) {
-      threads = {8 * mmaLayout.getWarpsPerCTA()[0],
-                 4 * mmaLayout.getWarpsPerCTA()[1]};
-    } else
-      llvm::report_fatal_error("Unimplemented usage of MmaEncodingAttr");
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    unsigned mDim = mfmaLayout.getMDim();
-    unsigned nDim = mfmaLayout.getNDim();
-    assert(mDim == nDim);
-    SmallVector<unsigned> threadsPerWarp;
-    if (32 == mDim) {
-      threadsPerWarp = {2, 32};
-    } else {
-      threadsPerWarp = {4, 16};
-    }
-    if (mfmaLayout.getIsTransposed())
-      threads = {threadsPerWarp[1] * mfmaLayout.getWarpsPerCTA()[0],
-                 threadsPerWarp[0] * mfmaLayout.getWarpsPerCTA()[1]};
-    else
-      threads = {threadsPerWarp[0] * mfmaLayout.getWarpsPerCTA()[0],
-                 threadsPerWarp[1] * mfmaLayout.getWarpsPerCTA()[1]};
-  } else {
-    llvm::report_fatal_error("Unimplemented usage of getThreadsPerCTA");
-  }
-
-  return threads;
-}
-
 SmallVector<unsigned> getShapePerCTATile(Attribute layout,
                                          ArrayRef<int64_t> tensorShape) {
-  SmallVector<unsigned> shape;
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    for (unsigned d = 0, n = blockedLayout.getOrder().size(); d < n; ++d)
-      shape.push_back(blockedLayout.getSizePerThread()[d] *
-                      blockedLayout.getThreadsPerWarp()[d] *
-                      blockedLayout.getWarpsPerCTA()[d]);
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    shape = getShapePerCTATile(sliceLayout.getParent(), tensorShape);
-    shape.erase(shape.begin() + sliceLayout.getDim());
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    if (mmaLayout.isAmpere())
-      return {16 * mmaLayout.getWarpsPerCTA()[0],
-              8 * mmaLayout.getWarpsPerCTA()[1]};
-    if (mmaLayout.isVolta()) {
-      assert(!tensorShape.empty() && "Volta needs the tensorShape");
-      if (tensorShape.size() == 1) // must be SliceEncoding
-        return {static_cast<unsigned>(tensorShape[0]),
-                static_cast<unsigned>(tensorShape[0])};
-      return {static_cast<unsigned>(tensorShape[0]),
-              static_cast<unsigned>(tensorShape[1])};
-    }
-    if (mmaLayout.isHopper()) {
-      auto instrShape = mmaLayout.getInstrShape();
-      return {16 * mmaLayout.getWarpsPerCTA()[0],
-              instrShape[1] * mmaLayout.getWarpsPerCTA()[1]};
-    }
-    llvm::report_fatal_error("Unexpected MMA layout version found");
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    unsigned mDim = mfmaLayout.getMDim();
-    unsigned nDim = mfmaLayout.getNDim();
-    return {mDim * mfmaLayout.getWarpsPerCTA()[0],
-            nDim * mfmaLayout.getWarpsPerCTA()[1]};
-  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
-    auto parentLayout = dotLayout.getParent();
-    assert(parentLayout && "DotOperandEncodingAttr must have a parent");
-    if (auto parentMmaLayout = parentLayout.dyn_cast<MmaEncodingAttr>()) {
-      assert(parentMmaLayout.isAmpere() &&
-             "mmaLayout version = 1 is not implemented yet");
-      auto parentShapePerCTATile =
-          getShapePerCTATile(parentLayout, tensorShape);
-      auto opIdx = dotLayout.getOpIdx();
-
-      if (opIdx == 0) {
-        return {parentShapePerCTATile[0], 16};
-      } else if (opIdx == 1) {
-        return {16, parentShapePerCTATile[1]};
-      } else {
-        llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
-      }
-    } else if (auto parentMfmaLayout =
-                   parentLayout.dyn_cast<MfmaEncodingAttr>()) {
-      auto parentShapePerCTA = getShapePerCTATile(parentLayout, tensorShape);
-      auto opIdx = dotLayout.getOpIdx();
-
-      if (opIdx == 0) {
-        return {parentShapePerCTA[0], 32};
-      } else if (opIdx == 1) {
-        return {32, parentShapePerCTA[1]};
-      } else {
-        assert(0 && "DotOperandEncodingAttr opIdx must be 0 or 1");
-      }
-    } else {
-      llvm::report_fatal_error(
-          "DotOperandEncodingAttr non-MmaEncodingAttr parent not "
-          "supported yet");
-    }
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    return distributedLayout.getShapePerCTATile(tensorShape);
   } else {
-    llvm::report_fatal_error("Unimplemented usage of getShapePerCTATile");
+    llvm::report_fatal_error("getShapePerCTATile not implemented");
+    return SmallVector<unsigned>();
   }
-  return shape;
 }
 
 bool isExpensiveView(Type srcType, Type dstType) {
   return getTotalElemsPerThread(srcType) != getTotalElemsPerThread(dstType);
 }
 
-namespace {
-
 /* Utility function used by getOrder and getCTAOrder of SliceEncodingAttr.
  * Erase dim and decrease all values larger than dim by 1.
  * Example:    order = [0, 2, 4, 3, 1], dim = 2
  *          resOrder = [0,    3, 2, 1]
  */
-SmallVector<unsigned> eraseOrder(ArrayRef<unsigned> order, unsigned dim) {
+static SmallVector<unsigned> eraseOrder(ArrayRef<unsigned> order,
+                                        unsigned dim) {
   unsigned rank = order.size();
   assert(dim < rank && "Invalid dim to erase");
   SmallVector<unsigned> resOrder;
@@ -487,54 +230,70 @@ SmallVector<unsigned> eraseOrder(ArrayRef<unsigned> order, unsigned dim) {
   return resOrder;
 }
 
-} // namespace
+SmallVector<unsigned> getWarpOrder(Attribute layout) {
+  auto order = getOrder(layout);
+  if (auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(layout)) {
+    if (mmaLayout.isHopper()) {
+      // Hopper MMA instructions force a warp order of [0, 1]. See docs:
+      // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-wgmma-mma-async-m64nnk8
+      auto it = std::find(order.begin(), order.end(), 0);
+      order.erase(it);
+      order.insert(order.begin(), 0);
+    }
+  }
+  return order;
+}
 
 SmallVector<unsigned> getOrder(Attribute layout) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    return SmallVector<unsigned>(blockedLayout.getOrder().begin(),
-                                 blockedLayout.getOrder().end());
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    return {1, 0};
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    return {1, 0};
-  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
-    return {1, 0};
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+  if (auto blockedLayout = dyn_cast<BlockedEncodingAttr>(layout)) {
+    return llvm::to_vector(blockedLayout.getOrder());
+  }
+  if (auto mmaLayout = dyn_cast<MmaEncodingTrait>(layout)) {
+    auto distributedLayout = cast<DistributedEncodingTrait>(layout);
+    auto rank = distributedLayout.getWarpsPerCTA().size();
+    SmallVector<unsigned> order(rank);
+    std::iota(order.rbegin(), order.rend(), 0);
+    auto mfmaLayout = dyn_cast<AMDMfmaEncodingAttr>(layout);
+    if (!mfmaLayout)
+      return order;
+    // For transposed MFMA layouts, we swap M and N dimensions, which is
+    // always the first two in order; as we can have an optional batch
+    // dimension following them.
+    if (mfmaLayout.getIsTransposed())
+      std::swap(order[0], order[1]);
+    return order;
+  }
+  if (auto dotLayout = dyn_cast<DotOperandEncodingAttr>(layout)) {
+    auto rank = getWarpsPerCTA(dotLayout.getParent()).size();
+    SmallVector<unsigned> order(rank);
+    std::iota(order.rbegin(), order.rend(), 0);
+    return order;
+  }
+  if (auto sliceLayout = dyn_cast<SliceEncodingAttr>(layout)) {
     SmallVector<unsigned> parentOrder = getOrder(sliceLayout.getParent());
     unsigned dim = sliceLayout.getDim();
     SmallVector<unsigned> order;
     for (unsigned d : parentOrder) {
-      if (d == dim)
-        continue;
-      else if (d > dim)
-        order.push_back(d - 1);
-      else
-        order.push_back(d);
+      if (d != dim)
+        order.push_back(d > dim ? d - 1 : d);
     }
     return order;
-  } else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
-    return SmallVector<unsigned>(sharedLayout.getOrder().begin(),
-                                 sharedLayout.getOrder().end());
-  } else {
-    llvm::report_fatal_error("Unimplemented usage of getOrder");
   }
+  if (auto sharedLayout = mlir::dyn_cast<SharedEncodingAttr>(layout)) {
+    return llvm::to_vector(sharedLayout.getOrder());
+  }
+
+  llvm::report_fatal_error("Unimplemented usage of getOrder");
   return {};
 };
 
 CTALayoutAttr getCTALayout(Attribute layout) {
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>())
-    return blockedLayout.getCTALayout();
-  else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>())
-    return CTALayoutAttr::get(layout.getContext(), getCTAsPerCGA(sliceLayout),
-                              getCTASplitNum(sliceLayout),
-                              getCTAOrder(sliceLayout));
-  else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>())
-    return mmaLayout.getCTALayout();
-  else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>())
-    return CTALayoutAttr::get(layout.getContext(), getCTAsPerCGA(dotLayout),
-                              getCTASplitNum(dotLayout),
-                              getCTAOrder(dotLayout));
-  else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>())
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    return CTALayoutAttr::get(
+        layout.getContext(), getCTAsPerCGA(distributedLayout),
+        getCTASplitNum(distributedLayout), getCTAOrder(distributedLayout));
+  } else if (auto sharedLayout = mlir::dyn_cast<SharedEncodingAttr>(layout))
     return sharedLayout.getCTALayout();
   else
     llvm::report_fatal_error("Unimplemented usage of getCTALayout");
@@ -543,39 +302,11 @@ CTALayoutAttr getCTALayout(Attribute layout) {
 
 SmallVector<unsigned> getCTAsPerCGA(Attribute layout) {
   ArrayRef<unsigned> ref;
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>())
-    ref = blockedLayout.getCTALayout().getCTAsPerCGA();
-  else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    auto parentCTAsPerCGA = getCTAsPerCGA(sliceLayout.getParent());
-    if (parentCTAsPerCGA[sliceLayout.getDim()] == 1) {
-      parentCTAsPerCGA.erase(parentCTAsPerCGA.begin() + sliceLayout.getDim());
-      return parentCTAsPerCGA;
-    }
-    /* For getCTAsPerCGA of a slice layout, we have two choices:
-     * (1) Return CTAsPerCGA of its parent. This is not a perfect solution
-     * because the rank of the returned CTAsPerCGA does not match the rank of
-     * tensorShape.
-     * (2) Get CTAsPerCGA of its parent and erase the sliced dim. This is not a
-     * perfect solution because the product of the returned CTAsPerCGA might not
-     * match numCTAs.
-     * To avoid introducing inconsistencies to the shape and
-     * layout system, the usage of directly getting CTAsPerCGA of a slice layout
-     * in which the sliced dim is not 1 is banned. You should always consider
-     * slice layout as a special case and use getCTAsPerCGA(layout.getParent())
-     * in the branch where layout is an instance of SliceEncodingAttr. This is
-     * inconvenient but safe.
-     */
-    llvm::report_fatal_error(
-        "getCTAsPerCGA for SliceEncodingAttr is not well-defined");
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>())
-    ref = mmaLayout.getCTALayout().getCTAsPerCGA();
-#ifdef USE_ROCM
-  else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>())
+  if (auto distributedLayout = mlir::dyn_cast<DistributedEncodingTrait>(layout))
+    return distributedLayout.getCTAsPerCGA();
+  else if (mlir::isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout))
     return {1, 1};
-#endif
-  else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>())
-    return getCTAsPerCGA(dotLayout.getParent());
-  else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>())
+  else if (auto sharedLayout = mlir::dyn_cast<SharedEncodingAttr>(layout))
     ref = sharedLayout.getCTALayout().getCTAsPerCGA();
   else
     llvm::report_fatal_error("Unimplemented usage of getCTAsPerCGA");
@@ -584,58 +315,34 @@ SmallVector<unsigned> getCTAsPerCGA(Attribute layout) {
 
 SmallVector<unsigned> getCTASplitNum(Attribute layout) {
   SmallVector<unsigned> res;
-
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    res.assign(blockedLayout.getCTALayout().getCTASplitNum().begin(),
-               blockedLayout.getCTALayout().getCTASplitNum().end());
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    res = getCTASplitNum(sliceLayout.getParent());
-    res.erase(res.begin() + sliceLayout.getDim());
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    res.assign(mmaLayout.getCTALayout().getCTASplitNum().begin(),
-               mmaLayout.getCTALayout().getCTASplitNum().end());
-#ifdef USE_ROCM
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    return distributedLayout.getCTASplitNum();
+  } else if (mlir::isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout)) {
     res.resize(2);
     res[0] = res[1] = 1;
-#endif
-  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
-    res = getCTASplitNum(dotLayout.getParent());
-    assert(res.size() == 2 && "Invalid dotLayout");
-
-    // Do not split CTA in K dimension
-    dotLayout.getOpIdx() == 0 ? res[1] = 1 : res[0] = 1;
-  } else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
+  } else if (auto sharedLayout = mlir::dyn_cast<SharedEncodingAttr>(layout)) {
     res.assign(sharedLayout.getCTALayout().getCTASplitNum().begin(),
                sharedLayout.getCTALayout().getCTASplitNum().end());
   } else {
     assert(false && "Unimplemented usage of getCTASplitNum");
   }
-
   return res;
 }
 
 SmallVector<unsigned> getCTAOrder(Attribute layout) {
-  ArrayRef<unsigned> ref;
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>()) {
-    ref = blockedLayout.getCTALayout().getCTAOrder();
-  } else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
-    auto parentCTAOrder = getCTAOrder(sliceLayout.getParent());
-    return eraseOrder(parentCTAOrder, sliceLayout.getDim());
-  } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
-    ref = mmaLayout.getCTALayout().getCTAOrder();
-#ifdef USE_ROCM
-  } else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
+  SmallVector<unsigned> res;
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(layout)) {
+    res = distributedLayout.getCTAOrder();
+  } else if (mlir::isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout)) {
     return {0, 1};
-#endif
-  } else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>()) {
-    return getCTAOrder(dotLayout.getParent());
-  } else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
-    ref = sharedLayout.getCTALayout().getCTAOrder();
+  } else if (auto sharedLayout = mlir::dyn_cast<SharedEncodingAttr>(layout)) {
+    res = SmallVector<unsigned>(sharedLayout.getCTALayout().getCTAOrder());
   } else {
     llvm::report_fatal_error("Unimplemented usage of getCTAOrder");
   }
-  return SmallVector<unsigned>(ref.begin(), ref.end());
+  return res;
 }
 
 SmallVector<int64_t> getShapePerCTA(ArrayRef<unsigned> CTASplitNum,
@@ -651,7 +358,7 @@ SmallVector<int64_t> getShapePerCTA(ArrayRef<unsigned> CTASplitNum,
 }
 
 SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape) {
-  if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>()) {
+  if (auto sharedLayout = mlir::dyn_cast<SharedEncodingAttr>(layout)) {
     // Special logic for pipeline pass, where shape is 3D and CTALayout is 2D.
     // The first dim of shape is numStages. This is a work around, otherwise too
     // many places would have to be modified in pipeline pass. Maybe we need to
@@ -667,25 +374,27 @@ SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape) {
 }
 
 SmallVector<int64_t> getShapePerCTA(Type type) {
-  auto tensorType = type.cast<RankedTensorType>();
+  auto tensorType = cast<TensorOrMemDesc>(type);
   return getShapePerCTA(tensorType.getEncoding(), tensorType.getShape());
 }
 
 unsigned getNumWarpsPerCTA(Attribute layout) {
-  ArrayRef<unsigned> warpsPerCTA;
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>())
+  SmallVector<unsigned> warpsPerCTA;
+  if (auto blockedLayout = dyn_cast<BlockedEncodingAttr>(layout))
     warpsPerCTA = blockedLayout.getWarpsPerCTA();
-  else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>())
+  else if (auto sliceLayout = dyn_cast<SliceEncodingAttr>(layout))
     return getNumWarpsPerCTA(sliceLayout.getParent());
-  else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>())
-    warpsPerCTA = mmaLayout.getWarpsPerCTA();
-#ifdef USE_ROCM
-  else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>())
+  else if (auto mmaLayout = dyn_cast<MmaEncodingTrait>(layout)) {
+    // Use the distributed layout interface to get the number of warps per CTA.
+    auto distributedLayout = cast<DistributedEncodingTrait>(layout);
+    warpsPerCTA = distributedLayout.getWarpsPerCTA();
+  } else if (auto mfmaLayout = dyn_cast<AMDMfmaEncodingAttr>(layout))
     warpsPerCTA = mfmaLayout.getWarpsPerCTA();
-#endif
-  else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>())
+  else if (auto wmmaLayout = dyn_cast<AMDWmmaEncodingAttr>(layout))
+    warpsPerCTA = wmmaLayout.getWarpsPerCTA();
+  else if (auto dotLayout = dyn_cast<DotOperandEncodingAttr>(layout))
     return getNumWarpsPerCTA(dotLayout.getParent());
-  else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>())
+  else if (auto sharedLayout = dyn_cast<SharedEncodingAttr>(layout))
     llvm::report_fatal_error("Cannot get numWarps from SharedEncodingAttr");
   else
     llvm::report_fatal_error("Unimplemented usage of getNumWarpsPerCTA");
@@ -693,101 +402,31 @@ unsigned getNumWarpsPerCTA(Attribute layout) {
 }
 
 unsigned getNumCTAs(Attribute layout) {
-  ArrayRef<unsigned> CTAsPerCGA;
-  if (auto blockedLayout = layout.dyn_cast<BlockedEncodingAttr>())
-    CTAsPerCGA = blockedLayout.getCTALayout().getCTAsPerCGA();
-  else if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>())
-    return getNumCTAs(sliceLayout.getParent());
-  else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>())
-    CTAsPerCGA = mmaLayout.getCTALayout().getCTAsPerCGA();
-#ifdef USE_ROCM
-  else if (auto mfmaLayout = layout.dyn_cast<MfmaEncodingAttr>()) {
-    return 1;
-  }
-#endif
-  else if (auto dotLayout = layout.dyn_cast<DotOperandEncodingAttr>())
-    return getNumCTAs(dotLayout.getParent());
-  else if (auto sharedLayout = layout.dyn_cast<SharedEncodingAttr>())
-    CTAsPerCGA = sharedLayout.getCTALayout().getCTAsPerCGA();
-  else
-    llvm::report_fatal_error("Unimplemented usage of getNumCTAs");
-  return product<unsigned>(CTAsPerCGA);
+  return product<unsigned>(getCTAsPerCGA(layout));
 }
 
 bool isaDistributedLayout(Attribute layout) {
-  return layout.isa<BlockedEncodingAttr>() || layout.isa<MmaEncodingAttr>() ||
-         layout.isa<MfmaEncodingAttr>() || layout.isa<SliceEncodingAttr>();
+  return isa<BlockedEncodingAttr, MmaEncodingTrait, SliceEncodingAttr>(layout);
 }
 
-bool sameBlockedEncodings(BlockedEncodingAttr blockedA,
-                          BlockedEncodingAttr blockedB) {
-  auto sizePerThreadA = blockedA.getSizePerThread();
-  auto threadsPerWarpA = blockedA.getThreadsPerWarp();
-  auto warpsPerCTAA = blockedA.getWarpsPerCTA();
-  auto orderA = blockedA.getOrder();
-  size_t rankA = orderA.size();
-
-  auto sizePerThreadB = blockedB.getSizePerThread();
-  auto threadsPerWarpB = blockedB.getThreadsPerWarp();
-  auto warpsPerCTAB = blockedB.getWarpsPerCTA();
-  auto orderB = blockedB.getOrder();
-  size_t rankB = orderB.size();
-
-  if (rankA != rankB) {
-    return false;
-  }
-  for (size_t i = 0; i < rankA; ++i) {
-    if (sizePerThreadA[i] != sizePerThreadB[i] ||
-        threadsPerWarpA[i] != threadsPerWarpB[i] ||
-        warpsPerCTAA[i] != warpsPerCTAB[i] || orderA[i] != orderB[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool sameMfmaEncodings(MfmaEncodingAttr mfmaA, MfmaEncodingAttr mfmaB) {
-  auto mDimA = mfmaA.getMDim();
-  auto nDimA = mfmaA.getNDim();
-  auto warpsPerCTAA = mfmaA.getWarpsPerCTA();
-  auto isTransposedA = mfmaA.getIsTransposed();
-
-  auto mDimB = mfmaB.getMDim();
-  auto nDimB = mfmaB.getNDim();
-  auto warpsPerCTAB = mfmaB.getWarpsPerCTA();
-  auto isTransposedB = mfmaB.getIsTransposed();
-
-  if (mDimA != mDimB || nDimA != nDimB || isTransposedA != isTransposedB) {
-    return false;
-  }
-
-  if (warpsPerCTAA.size() != warpsPerCTAB.size()) {
-    return false;
-  }
-
-  auto rank = warpsPerCTAA.size();
-  for (size_t i = 0; i < rank; ++i) {
-    if (warpsPerCTAA[i] != warpsPerCTAB[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool isSharedEncoding(Value value) {
+template <typename T> bool hasEncoding(Value value) {
   auto type = value.getType();
-  if (auto tensorType = type.dyn_cast<RankedTensorType>()) {
+  if (auto tensorType = dyn_cast<TensorOrMemDesc>(type)) {
     auto encoding = tensorType.getEncoding();
-    return encoding && encoding.isa<triton::gpu::SharedEncodingAttr>();
+    return encoding && isa<T>(encoding);
   }
   return false;
+}
+
+bool hasDotOperandEncoding(Value value) {
+  return hasEncoding<triton::gpu::DotOperandEncodingAttr>(value);
 }
 
 bool isExpensiveCat(CatOp cat, Attribute targetEncoding) {
   // If the new elements per thread is less than the old one, we will need to do
   // convert encoding that goes through shared memory anyway. So we consider it
   // as expensive.
-  auto tensorTy = cat.getResult().getType().cast<RankedTensorType>();
+  RankedTensorType tensorTy = cat.getType();
   auto totalElemsPerThread = gpu::getTotalElemsPerThread(tensorTy);
   auto shape = tensorTy.getShape();
   auto elemTy = tensorTy.getElementType();
@@ -796,13 +435,76 @@ bool isExpensiveCat(CatOp cat, Attribute targetEncoding) {
   return newTotalElemsPerThread < totalElemsPerThread;
 }
 
+LogicalResult CTALayoutAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, ArrayRef<unsigned> CTAsPerCGA,
+    ArrayRef<unsigned> CTASplitNum, ArrayRef<unsigned> CTAOrder) {
+  if (CTAsPerCGA.size() != CTASplitNum.size() ||
+      CTASplitNum.size() != CTAOrder.size()) {
+    return emitError() << "CTAsPerCGA, CTASplitNum, and CTAOrder must all have "
+                          "the same rank.";
+  }
+
+  if (!isPermutationOfIota(CTAOrder)) {
+    return emitError()
+           << "CTAOrder must be a permutation of 0..(rank-1), but was ["
+           << CTAOrder << "]";
+  }
+
+  return success();
+}
+
+LogicalResult
+BlockedEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                            ArrayRef<unsigned> sizePerThread,
+                            ArrayRef<unsigned> threadsPerWarp,
+                            ArrayRef<unsigned> warpsPerCTA,
+                            ArrayRef<unsigned> order, CTALayoutAttr CTALayout) {
+  if (sizePerThread.size() != threadsPerWarp.size() ||
+      threadsPerWarp.size() != warpsPerCTA.size() ||
+      warpsPerCTA.size() != order.size()) {
+    return emitError() << "sizePerThread, threadsPerWarp, warpsPerCTA, and "
+                          "order must all have the same rank.";
+  }
+
+  // Empty CTALayout is allowed, but if it's present its rank must match the
+  // BlockedEncodingAttr's rank.
+  if (CTALayout.getCTASplitNum().size() != 0 &&
+      sizePerThread.size() != CTALayout.getCTASplitNum().size()) {
+    return emitError() << "BlockedEncodingAttr and CTALayout's fields must "
+                          "have the same rank.";
+  }
+  if (!isPermutationOfIota(order)) {
+    return emitError()
+           << "order must be a permutation of 0..(rank-1), but was [" << order
+           << "]";
+  }
+  return success();
+}
+
+// 1 element per thread
+// order = reverse(arange(rank))
+triton::gpu::BlockedEncodingAttr
+getDefaultBlockedEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                          int numWarps, int threadsPerWarp, int numCTAs) {
+  int rank = shape.size();
+  llvm::SmallVector<unsigned> order(rank);
+  std::iota(order.begin(), order.end(), 0);
+  std::reverse(order.begin(), order.end());
+  llvm::SmallVector<unsigned> sizePerThread(rank, 1);
+  triton::gpu::BlockedEncodingAttr encoding =
+      triton::gpu::BlockedEncodingAttr::get(context, shape, sizePerThread,
+                                            order, numWarps, threadsPerWarp,
+                                            numCTAs);
+  return encoding;
+}
+
 } // namespace gpu
 } // namespace triton
 } // namespace mlir
 
 static LogicalResult parseIntAttrValue(AsmParser &parser, Attribute attr,
                                        unsigned &value, StringRef desc) {
-  auto intAttr = attr.dyn_cast<IntegerAttr>();
+  auto intAttr = mlir::dyn_cast<IntegerAttr>(attr);
   if (!intAttr) {
     parser.emitError(parser.getNameLoc(), "expected an integer type in ")
         << desc;
@@ -834,7 +536,7 @@ static LogicalResult parseIntAttrValue(AsmParser &parser, Attribute attr,
 
 static LogicalResult parseBoolAttrValue(AsmParser &parser, Attribute attr,
                                         bool &value, StringRef desc) {
-  auto boolAttr = attr.dyn_cast<BoolAttr>();
+  auto boolAttr = mlir::dyn_cast<BoolAttr>(attr);
   if (!boolAttr) {
     parser.emitError(parser.getNameLoc(), "expected an bool type in ") << desc;
     return failure();
@@ -848,7 +550,7 @@ static LogicalResult parseIntArrayAttr(AsmParser &parser,
                                        const NamedAttribute &attr,
                                        SmallVector<unsigned> &res,
                                        StringRef desc) {
-  auto arrayAttr = attr.getValue().dyn_cast<ArrayAttr>();
+  auto arrayAttr = mlir::dyn_cast<ArrayAttr>(attr.getValue());
   if (!arrayAttr) {
     parser.emitError(parser.getNameLoc(), "expected an array for ") << desc;
     return failure();
@@ -872,9 +574,22 @@ static LogicalResult parseBool(AsmParser &parser, const NamedAttribute &attr,
   return parseBoolAttrValue(parser, attr.getValue(), value, desc);
 };
 
+// Print the CTALayout if it's not equal to the default.
+static void maybePrintCTALayout(mlir::MLIRContext *context,
+                                mlir::AsmPrinter &printer, CTALayoutAttr layout,
+                                unsigned rank) {
+  if (layout != CTALayoutAttr::getDefault(context, rank)) {
+    printer << ", CTAsPerCGA = [" << ArrayRef(layout.getCTAsPerCGA()) << "]"
+            << ", CTASplitNum = [" << ArrayRef(layout.getCTASplitNum()) << "]"
+            << ", CTAOrder = [" << ArrayRef(layout.getCTAOrder()) << "]";
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Attribute methods
 //===----------------------------------------------------------------------===//
+#include "triton/Dialect/TritonGPU/IR/TritonGPUAttrInterfaces.cpp.inc"
+
 #define GET_ATTRDEF_CLASSES
 #include "triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.cpp.inc"
 
@@ -901,6 +616,42 @@ BlockedEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
 unsigned BlockedEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
                                                      Type eltTy) const {
   return product<unsigned>(getElemsPerThread(shape, eltTy));
+}
+
+// If we only had BlockedEncodingAttr, we could simply return ArrayRefs here.
+// But we need to have a consistent interface with e.g. SliceEncodingAttr, which
+// computes some of these fields.
+SmallVector<unsigned> BlockedEncodingAttr::getCTAsPerCGA() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAsPerCGA());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getCTAOrder() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAOrder());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getCTASplitNum() const {
+  return SmallVector<unsigned>(getCTALayout().getCTASplitNum());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getWarpsPerCTA() const {
+  return SmallVector<unsigned>(getWarpsPerCTA__());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getWarpOrder() const {
+  return SmallVector<unsigned>(getOrder());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getThreadsPerWarp() const {
+  return SmallVector<unsigned>(getThreadsPerWarp__());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getThreadOrder() const {
+  return SmallVector<unsigned>(getOrder());
+}
+SmallVector<unsigned> BlockedEncodingAttr::getSizePerThread() const {
+  return SmallVector<unsigned>(getSizePerThread__());
+}
+SmallVector<unsigned>
+BlockedEncodingAttr::getShapePerCTATile(ArrayRef<int64_t> tensorShape) const {
+  SmallVector<unsigned> shape;
+  for (unsigned d = 0, n = getOrder().size(); d < n; ++d)
+    shape.push_back(getSizePerThread()[d] * getThreadsPerWarp()[d] *
+                    getWarpsPerCTA()[d]);
+  return shape;
 }
 
 template <class T>
@@ -936,34 +687,151 @@ unsigned SliceEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
                                                    Type eltTy) const {
   return product<unsigned>(getElemsPerThread(shape, eltTy));
 }
-
-SmallVector<unsigned>
-MfmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape, Type eltTy) const {
-  size_t rank = shape.size();
-  assert(rank == 2 && "Unexpected rank of mfma layout");
-
-  auto mfmaMDim = getMDim();
-  auto mfmaNDim = getNDim();
-  auto elemsPerThreadPerTile = (mfmaMDim == 32 ? 16 : 4);
-  unsigned elemsCol = 0, elemsRow = 0;
-  if (getIsTransposed()) {
-    elemsCol = ceil<unsigned>(shape[1], mfmaNDim * getWarpsPerCTA()[1]) *
-               elemsPerThreadPerTile;
-    elemsRow = ceil<unsigned>(shape[0], mfmaMDim * getWarpsPerCTA()[0]);
-  } else {
-    elemsCol = ceil<unsigned>(shape[1], mfmaNDim * getWarpsPerCTA()[1]);
-    elemsRow = ceil<unsigned>(shape[0], mfmaMDim * getWarpsPerCTA()[0]) *
-               elemsPerThreadPerTile;
+SmallVector<unsigned> SliceEncodingAttr::getCTASplitNum() const {
+  SmallVector<unsigned> res = ::getCTASplitNum(getParent());
+  res.erase(res.begin() + getDim());
+  return res;
+}
+SmallVector<unsigned> SliceEncodingAttr::getCTAOrder() const {
+  auto parentCTAOrder = ::getCTAOrder(getParent());
+  return eraseOrder(parentCTAOrder, getDim());
+}
+SmallVector<unsigned> SliceEncodingAttr::getCTAsPerCGA() const {
+  auto parentCTAsPerCGA = ::getCTAsPerCGA(getParent());
+  if (parentCTAsPerCGA[getDim()] == 1) {
+    parentCTAsPerCGA.erase(parentCTAsPerCGA.begin() + getDim());
+    return parentCTAsPerCGA;
   }
-  return {elemsRow, elemsCol};
+  /* For getCTAsPerCGA of a slice layout, we have two choices:
+   * (1) Return CTAsPerCGA of its parent. This is not a perfect solution
+   * because the rank of the returned CTAsPerCGA does not match the rank of
+   * tensorShape.
+   * (2) Get CTAsPerCGA of its parent and erase the sliced dim. This is not a
+   * perfect solution because the product of the returned CTAsPerCGA might not
+   * match numCTAs.
+   * To avoid introducing inconsistencies to the shape and
+   * layout system, the usage of directly getting CTAsPerCGA of a slice layout
+   * in which the sliced dim is not 1 is banned. You should always consider
+   * slice layout as a special case and use getCTAsPerCGA(layout.getParent())
+   * in the branch where layout is an instance of SliceEncodingAttr. This is
+   * inconvenient but safe.
+   */
+  llvm::report_fatal_error(
+      "getCTAsPerCGA for SliceEncodingAttr is not well-defined");
+}
+SmallVector<unsigned> SliceEncodingAttr::getWarpsPerCTA() const {
+  auto parent = getParent();
+  auto parentWarpsPerCTA = ::getWarpsPerCTA(parent);
+  SmallVector<unsigned> warpsPerCTA = parentWarpsPerCTA;
+  warpsPerCTA.erase(warpsPerCTA.begin() + getDim());
+  int32_t nextDim = getDim() < warpsPerCTA.size() ? getDim() : getDim() - 1;
+  warpsPerCTA[nextDim] *= parentWarpsPerCTA[getDim()];
+  return warpsPerCTA;
+}
+SmallVector<unsigned> SliceEncodingAttr::getWarpOrder() const {
+  return ::getWarpOrder(*this);
+}
+SmallVector<unsigned> SliceEncodingAttr::getThreadsPerWarp() const {
+  auto parent = getParent();
+  auto parentThreadsPerWarp = ::getThreadsPerWarp(parent);
+  SmallVector<unsigned> threadsPerWarp = parentThreadsPerWarp;
+  threadsPerWarp.erase(threadsPerWarp.begin() + getDim());
+  int32_t nextDim = getDim() < threadsPerWarp.size() ? getDim() : getDim() - 1;
+  threadsPerWarp[nextDim] *= parentThreadsPerWarp[getDim()];
+  return threadsPerWarp;
+}
+SmallVector<unsigned> SliceEncodingAttr::getThreadOrder() const {
+  return ::getOrder(*this);
+}
+SmallVector<unsigned> SliceEncodingAttr::getSizePerThread() const {
+  auto sizePerThread = ::getSizePerThread(getParent());
+  sizePerThread.erase(sizePerThread.begin() + getDim());
+  return sizePerThread;
+}
+SmallVector<unsigned>
+SliceEncodingAttr::getShapePerCTATile(ArrayRef<int64_t> tensorShape) const {
+  SmallVector<unsigned> shape = ::getShapePerCTATile(getParent(), tensorShape);
+  shape.erase(shape.begin() + getDim());
+  return shape;
 }
 
+//
+
 SmallVector<unsigned>
-MmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape, Type eltTy) const {
+AMDMfmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
+                                       Type eltTy) const {
   size_t rank = shape.size();
-  assert(rank == 2 && "Unexpected rank of mma layout");
+  assert((rank == 2 || rank == 3) && "Unexpected rank of mfma layout");
+
+  SmallVector<unsigned> elemsPerThread(rank);
+  auto nonKDim = getMDim();
+  auto elemsPerThreadPerTile = (nonKDim == 16 ? 4 : 16);
+  if (rank == 3)
+    elemsPerThread[0] = ceil<unsigned>(shape[0], getWarpsPerCTA()[0]);
+  if (getIsTransposed()) {
+    unsigned elemsCol =
+        ceil<unsigned>(shape[rank - 1], nonKDim * getWarpsPerCTA()[rank - 1]) *
+        elemsPerThreadPerTile;
+    unsigned elemsRow =
+        ceil<unsigned>(shape[rank - 2], nonKDim * getWarpsPerCTA()[rank - 2]);
+    elemsPerThread[rank - 2] = elemsRow;
+    elemsPerThread[rank - 1] = elemsCol;
+  } else {
+    unsigned elemsCol =
+        ceil<unsigned>(shape[rank - 1], nonKDim * getWarpsPerCTA()[rank - 1]);
+    unsigned elemsRow =
+        ceil<unsigned>(shape[rank - 2], nonKDim * getWarpsPerCTA()[rank - 2]) *
+        elemsPerThreadPerTile;
+    elemsPerThread[rank - 2] = elemsRow;
+    elemsPerThread[rank - 1] = elemsCol;
+  }
+  return elemsPerThread;
+}
+
+unsigned AMDMfmaEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
+                                                     Type eltTy) const {
+  return product<unsigned>(getElemsPerThread(shape, eltTy));
+}
+
+//
+
+SmallVector<unsigned>
+AMDWmmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
+                                       Type eltTy) const {
+  size_t rank = shape.size();
+  assert((rank == 2 || rank == 3) && "Unexpected rank of wmma layout");
+
+  SmallVector<unsigned> elemsPerThread(rank);
+  auto mnkDim = getMNKDimPerWMMAInstr();
+  auto elemsPerThreadPerTile = getSizePerThread();
+  auto warpsPerCTA = getWarpsPerCTA();
+
+  if (rank == 3)
+    elemsPerThread[0] = ceil<unsigned>(shape[0], getWarpsPerCTA()[0]);
+  elemsPerThread[rank - 2] =
+      ceil<unsigned>(shape[rank - 2], mnkDim[0] * warpsPerCTA[rank - 2]) *
+      elemsPerThreadPerTile[rank - 2];
+  elemsPerThread[rank - 1] =
+      ceil<unsigned>(shape[rank - 1], mnkDim[1] * warpsPerCTA[rank - 1]) *
+      elemsPerThreadPerTile[rank - 1];
+  return elemsPerThread;
+}
+
+unsigned AMDWmmaEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
+                                                     Type eltTy) const {
+  return product<unsigned>(getElemsPerThread(shape, eltTy));
+}
+
+//
+
+SmallVector<unsigned>
+NvidiaMmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
+                                         Type eltTy) const {
+  size_t rank = shape.size();
+  assert(rank == 2 ||
+         (rank == 3 && isAmpere()) && "Unexpected rank of mma layout");
   assert((isVolta() || isAmpere() || isHopper()) &&
-         "For MmaEncodingAttr only version 1~3 is supported");
+         "For NvidiaMmaEncodingAttr only version 1~3 is supported");
 
   auto shapePerCTA = getShapePerCTA(getCTALayout().getCTASplitNum(), shape);
 
@@ -985,11 +853,15 @@ MmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape, Type eltTy) const {
     elemsPerThread[1] = resN;
   } else if (isAmpere()) {
     unsigned elemsRow =
-        ceil<unsigned>(shapePerCTA[0], 16 * getWarpsPerCTA()[0]) * 2;
+        ceil<unsigned>(shapePerCTA[rank - 2], 16 * getWarpsPerCTA()[rank - 2]) *
+        2;
     unsigned elemsCol =
-        ceil<unsigned>(shapePerCTA[1], 8 * getWarpsPerCTA()[1]) * 2;
-    elemsPerThread[0] = elemsRow;
-    elemsPerThread[1] = elemsCol;
+        ceil<unsigned>(shapePerCTA[rank - 1], 8 * getWarpsPerCTA()[rank - 1]) *
+        2;
+    if (rank == 3)
+      elemsPerThread[0] = ceil<unsigned>(shapePerCTA[0], getWarpsPerCTA()[0]);
+    elemsPerThread[rank - 2] = elemsRow;
+    elemsPerThread[rank - 1] = elemsCol;
   } else if (isHopper()) {
     auto wpt = getWarpsPerCTA();
     auto instrMNK = getInstrShape();
@@ -1004,14 +876,8 @@ MmaEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape, Type eltTy) const {
   return elemsPerThread;
 }
 
-unsigned MfmaEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
-                                                  Type eltTy) const {
-  return product<unsigned>(getElemsPerThread(shape, eltTy));
-}
-
-unsigned
-MmaEncodingAttr::getElemsPerThreadOfOperand(int opIdx,
-                                            ArrayRef<int64_t> shape) const {
+unsigned NvidiaMmaEncodingAttr::getElemsPerThreadOfOperand(
+    int opIdx, ArrayRef<int64_t> shape) const {
   size_t rank = shape.size();
   assert(rank == 2 && "Unexpected rank of mma layout");
   auto shapePerCTA = getShapePerCTA(*this, shape);
@@ -1040,10 +906,12 @@ MmaEncodingAttr::getElemsPerThreadOfOperand(int opIdx,
   return res;
 }
 
-unsigned MmaEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
-                                                 Type eltTy) const {
+unsigned NvidiaMmaEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
+                                                       Type eltTy) const {
   return product<unsigned>(getElemsPerThread(shape, eltTy));
 }
+
+//
 
 SmallVector<unsigned>
 SharedEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
@@ -1057,61 +925,6 @@ unsigned SharedEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
   return 0;
 }
 
-SmallVector<int64_t>
-DotOperandEncodingAttr::getMMAv2Rep(ArrayRef<int64_t> shape,
-                                    int bitwidth) const {
-  auto mmaParent = getParent().cast<MmaEncodingAttr>();
-  SmallVector<int> shapePerWarp = {16, 8, 4 * 64 / bitwidth};
-  auto warpsPerCTA = getParent().cast<MmaEncodingAttr>().getWarpsPerCTA();
-  assert(mmaParent.isAmpere());
-  if (getOpIdx() == 0)
-    return {std::max<int64_t>(1, shape[0] / (shapePerWarp[0] * warpsPerCTA[0])),
-            std::max<int64_t>(1, shape[1] / shapePerWarp[2])};
-  else {
-    assert(getOpIdx() == 1);
-    return {
-        std::max<int64_t>(1, shape[0] / shapePerWarp[2]),
-        std::max<int64_t>(1, shape[1] / (shapePerWarp[1] * warpsPerCTA[1]))};
-  }
-}
-
-SmallVector<int64_t>
-DotOperandEncodingAttr::getMFMAElemsPerInstr() const {
-  auto mfmaLayout = getParent().cast<MfmaEncodingAttr>();
-  unsigned mDim = mfmaLayout.getMDim();
-  unsigned nDim = mfmaLayout.getNDim();
-  assert((mDim == nDim) && (mDim == 32 || mDim == 16 || mDim == 4) ||
-         (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
-  int64_t kWidth = getKWidth();
-  constexpr int waveSize = 64; // MFMA is used on wave64 architectures only
-  int kGroups = -1;
-  if (mDim == nDim)
-    kGroups = waveSize / mDim;
-  if (mDim == 64 && nDim == 4 || mDim == 4 && nDim == 64)
-    kGroups = 1;
-  int64_t kDim = kWidth * kGroups;
-  if (getOpIdx() == 0)
-    return {mDim, kDim};
-  else
-    return {kDim, nDim};
-}
-
-SmallVector<int64_t>
-DotOperandEncodingAttr::getMFMARep(ArrayRef<int64_t> operandShape) const {
-  auto operandTileShape = getMFMAElemsPerInstr();
-  auto warpsPerCTA = getParent().cast<MfmaEncodingAttr>().getWarpsPerCTA();
-  if (getOpIdx() == 0)
-    return {
-        std::max<int64_t>(1, operandShape[0] / (operandTileShape[0] * warpsPerCTA[0])),
-        std::max<int64_t>(1, operandShape[1] / operandTileShape[1])};
-  else {
-    assert(getOpIdx() == 1);
-    return {std::max<int64_t>(1, operandShape[0] / operandTileShape[0]),
-            std::max<int64_t>(1, operandShape[1] /
-                                     (operandTileShape[1] * warpsPerCTA[1]))};
-  }
-}
-
 SmallVector<unsigned>
 DotOperandEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
                                           Type eltTy) const {
@@ -1121,96 +934,15 @@ DotOperandEncodingAttr::getElemsPerThread(ArrayRef<int64_t> shape,
 
 unsigned DotOperandEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
                                                         Type eltTy) const {
-  if (auto mfmaParent = getParent().dyn_cast<MfmaEncodingAttr>()) {
-    int warpsPerCTAM = mfmaParent.getWarpsPerCTA()[0];
-    int warpsPerCTAN = mfmaParent.getWarpsPerCTA()[1];
-    constexpr int waveSize = 64;
-    auto tileSize = getMFMAElemsPerInstr();
-    auto rep = getMFMARep(shape);
-    return rep[0] * rep[1];
+  if (auto mmaParent = mlir::dyn_cast<MmaEncodingTrait>(getParent())) {
+    return mmaParent.getTotalElemsPerThreadForOperands(shape, eltTy,
+                                                       getKWidth(), getOpIdx());
   }
-  auto shapePerCTA = getShapePerCTA(*this, shape);
-  if (auto mmaParent = getParent().dyn_cast<MmaEncodingAttr>()) {
-    int warpsPerCTAM = mmaParent.getWarpsPerCTA()[0];
-    int warpsPerCTAN = mmaParent.getWarpsPerCTA()[1];
-    // H100
-    if (mmaParent.isHopper()) {
-      if (eltTy.isF16())
-        return mmaParent.getTotalElemsPerThread(shape, eltTy);
-    }
-    // A100
-    if (mmaParent.isAmpere()) {
-      auto rep = getMMAv2Rep(shapePerCTA, eltTy.getIntOrFloatBitWidth());
-      if (getOpIdx() == 0)
-        return 4 * rep[0] * rep[1];
-      if (getOpIdx() == 1)
-        return 4 * rep[0] * std::max<int>(rep[1] / 2, 1);
-    }
-    // V100
-    if (mmaParent.isVolta()) {
-      bool isRow = getMMAv1IsRow();
-      bool isVec4 = getMMAv1IsVec4();
-      if (getOpIdx() == 0) {
-        int packSizeM = (isRow || isVec4) ? 1 : 2;
-        int repM = 2 * packSizeM;
-        int spwM = 2 * 4 * repM;
-        int numM = getMMAv1NumOuter(shape);
-        int NK = shape[1];
-        int vec = 2 * repM;
-        // Here we mimic the logic in loadA, the result cannot be calculated
-        // directly.
-        llvm::DenseSet<std::pair<int, int>> visited;
-        auto ld = [&](int m, int k) {
-          visited.insert({m, k});
-          if (vec > 4) {
-            if (isRow)
-              visited.insert({m, k + 4});
-            else
-              visited.insert({m + 1, k});
-          }
-        };
-        for (unsigned k = 0; k < NK; k += 4)
-          for (unsigned m = 0; m < numM / 2; ++m)
-            if (!visited.count({m, k}))
-              ld(m, k);
-        return visited.size() * 2;
-      }
-      if (getOpIdx() == 1) {
-        int packSizeN = (isRow && !isVec4) ? 2 : 1;
-        int repN = 2 * packSizeN;
-        int spwN = 2 * 4 * repN;
-        int numN = getMMAv1NumOuter(shape);
-        int vec = 2 * repN;
-
-        int NK = shape[0];
-        // Here we mimic the logic in loadA, the result cannot be calculated
-        // directly.
-        llvm::DenseSet<std::pair<int, int>> visited;
-        int elemsPerLd = vec > 4 ? 4 : 2;
-        auto ld = [&](int n, int k) {
-          visited.insert({n, k});
-          if (vec > 4) {
-            if (isRow)
-              visited.insert({n + 1, k});
-            else
-              visited.insert({n, k + 4});
-          }
-        };
-
-        for (unsigned k = 0; k < NK; k += 4)
-          for (unsigned n = 0; n < numN / 2; ++n) {
-            if (!visited.count({n, k}))
-              ld(n, k);
-          }
-
-        return visited.size() * 2;
-      }
-    }
-  }
-  if (auto blockedLayout = getParent().dyn_cast<BlockedEncodingAttr>()) {
-    auto shapePerCTATile = getShapePerCTATile(blockedLayout);
+  if (auto blockedLayout = mlir::dyn_cast<BlockedEncodingAttr>(getParent())) {
+    auto shapePerCTA = getShapePerCTA(*this, shape);
+    auto shapePerCTATile = ::getShapePerCTATile(blockedLayout);
     auto order = blockedLayout.getOrder();
-    auto sizePerThread = getSizePerThread(blockedLayout);
+    auto sizePerThread = ::getSizePerThread(blockedLayout);
 
     int K = getOpIdx() == 0 ? shapePerCTA[1] : shapePerCTA[0];
     int otherDim = getOpIdx() == 1 ? shapePerCTA[1] : shapePerCTA[0];
@@ -1234,10 +966,122 @@ unsigned DotOperandEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
   llvm_unreachable("unknown dot operand parent layout");
   return 0;
 }
+SmallVector<unsigned> DotOperandEncodingAttr::getCTAsPerCGA() const {
+  return ::getCTAsPerCGA(getParent());
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getCTAOrder() const {
+  return ::getCTAOrder(getParent());
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getCTASplitNum() const {
+  SmallVector<unsigned> res = ::getCTASplitNum(getParent());
+  auto rank = res.size();
+  assert(rank == 2 || rank == 3 && "Invalid dotLayout");
+
+  // Do not split CTA in K dimension
+  getOpIdx() == 0 ? res[rank - 1] = 1 : res[rank - 2] = 1;
+  return res;
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getWarpsPerCTA() const {
+  auto parentLayout = getParent();
+  assert(parentLayout && "DotOperandEncodingAttr must have a parent");
+  if (auto distributedLayout =
+          mlir::dyn_cast<DistributedEncodingTrait>(parentLayout)) {
+    return distributedLayout.getWarpsPerCTA();
+  } else {
+    llvm::report_fatal_error(
+        "DotOperandEncodingAttr non-DistributedEncodingAttr parent not "
+        "supported yet");
+  }
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getWarpOrder() const {
+  return ::getWarpOrder(*this);
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getThreadOrder() const {
+  return ::getOrder(*this);
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getShapePerCTATile(
+    ArrayRef<int64_t> tensorShape) const {
+  auto parentLayout = getParent();
+  assert(parentLayout && "DotOperandEncodingAttr must have a parent");
+  if (auto parentMmaLayout = mlir::dyn_cast<MmaEncodingTrait>(parentLayout)) {
+    return parentMmaLayout.getShapePerCTATileForDotOperands(tensorShape,
+                                                            getOpIdx());
+  } else {
+    llvm::report_fatal_error(
+        "DotOperandEncodingAttr non-NvidiaMmaEncodingAttr parent not "
+        "supported yet");
+  }
+}
+
+LogicalResult DotOperandEncodingAttr::verify(
+    ::llvm::function_ref<::mlir::InFlightDiagnostic()> emitError,
+    unsigned opIdx, Attribute parent, unsigned kWidth) {
+  if (opIdx != 0 && opIdx != 1) {
+    return emitError()
+           << "triton_gpu.dot_op opIdx paramenter can be 0 or 1, got: "
+           << opIdx;
+  }
+  if (!parent) {
+    return emitError() << "triton_gpu.dot_op parent paramenter cannot be null";
+  }
+  if (auto parentAttr = mlir::dyn_cast<NvidiaMmaEncodingAttr>(parent)) {
+    if (kWidth != 0 && !parentAttr.isAmpere())
+      return emitError() << "triton_gpu.dot_op kWidth parameter can only be "
+                            "non-zero for Ampere MMA parent";
+    if (kWidth == 0 && parentAttr.isAmpere())
+      return emitError()
+             << "triton_gpu.dot_op kWidth parameter is mandatory for "
+                "Ampere MMA parent";
+    return success();
+  }
+
+  if (auto parentAttr = mlir::dyn_cast<AMDWmmaEncodingAttr>(parent)) {
+    // TODO: remove this condition if new values are supported
+    if (kWidth != 16)
+      return emitError() << "triton_gpu.dot_op kWidth parameter supports "
+                            "only 16 for WMMA parent";
+    return success();
+  }
+
+  if (auto parentAttr = mlir::dyn_cast<AMDMfmaEncodingAttr>(parent)) {
+    if (kWidth == 0)
+      return emitError()
+             << "triton_gpu.dot_op kWidth parameter is mandatory for "
+                "MFMA parent";
+    return success();
+  }
+
+  if (auto parentAttr = mlir::dyn_cast<BlockedEncodingAttr>(parent)) {
+    if (kWidth != 0)
+      return emitError()
+             << "triton_gpu.dot_op kWidth parameter is not supported "
+                "when the parent is a blocked layout";
+    return success();
+  }
+
+  return emitError() << "triton_gpu.dot_op unexpected parent layout: "
+                     << parent;
+}
 
 //===----------------------------------------------------------------------===//
 // Blocked Encoding
 //===----------------------------------------------------------------------===//
+
+static std::optional<CTALayoutAttr> getCTALayoutOrError(
+    AsmParser &parser, std::optional<SmallVector<unsigned>> CTAsPerCGA,
+    std::optional<SmallVector<unsigned>> CTASplitNum,
+    std::optional<SmallVector<unsigned>> CTAOrder, unsigned rank) {
+  if (CTAsPerCGA && CTASplitNum && CTAOrder) {
+    return CTALayoutAttr::get(parser.getContext(), *CTAsPerCGA, *CTASplitNum,
+                              *CTAOrder);
+  }
+  if (!CTAsPerCGA && !CTASplitNum && !CTAOrder) {
+    return CTALayoutAttr::getDefault(parser.getContext(), rank);
+  }
+  parser.emitError(parser.getNameLoc(), "CTAsPerCGA, CTASplitNum, and CTAOrder "
+                                        "must all be present or all be absent");
+  return std::nullopt;
+}
 
 Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
   if (parser.parseLess().failed())
@@ -1253,9 +1097,9 @@ Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
   SmallVector<unsigned> threadsPerWarp;
   SmallVector<unsigned> warpsPerCTA;
   SmallVector<unsigned> order;
-  SmallVector<unsigned> CTAsPerCGA;
-  SmallVector<unsigned> CTASplitNum;
-  SmallVector<unsigned> CTAOrder;
+  std::optional<SmallVector<unsigned>> CTAsPerCGA;
+  std::optional<SmallVector<unsigned>> CTASplitNum;
+  std::optional<SmallVector<unsigned>> CTAOrder;
 
   for (const NamedAttribute &attr : dict) {
     if (attr.getName() == "sizePerThread") {
@@ -1277,13 +1121,16 @@ Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
       if (parseIntArrayAttr(parser, attr, order, "order").failed())
         return {};
     } else if (attr.getName() == "CTAsPerCGA") {
-      if (parseIntArrayAttr(parser, attr, CTAsPerCGA, "CTAsPerCGA").failed())
+      if (parseIntArrayAttr(parser, attr, CTAsPerCGA.emplace(), "CTAsPerCGA")
+              .failed())
         return {};
     } else if (attr.getName() == "CTASplitNum") {
-      if (parseIntArrayAttr(parser, attr, CTASplitNum, "CTASplitNum").failed())
+      if (parseIntArrayAttr(parser, attr, CTASplitNum.emplace(), "CTASplitNum")
+              .failed())
         return {};
     } else if (attr.getName() == "CTAOrder") {
-      if (parseIntArrayAttr(parser, attr, CTAOrder, "CTAOrder").failed())
+      if (parseIntArrayAttr(parser, attr, CTAOrder.emplace(), "CTAOrder")
+              .failed())
         return {};
     } else {
       parser.emitError(parser.getNameLoc(), "unexpected key: ")
@@ -1292,31 +1139,34 @@ Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
     }
   }
 
-  auto CTALayout = CTALayoutAttr::get(parser.getContext(), CTAsPerCGA,
-                                      CTASplitNum, CTAOrder);
+  std::optional<CTALayoutAttr> CTALayout = getCTALayoutOrError(
+      parser, CTAsPerCGA, CTASplitNum, CTAOrder, /*rank=*/sizePerThread.size());
+  if (!CTALayout.has_value())
+    return {};
 
   return parser.getChecked<BlockedEncodingAttr>(parser.getContext(),
                                                 sizePerThread, threadsPerWarp,
-                                                warpsPerCTA, order, CTALayout);
+                                                warpsPerCTA, order, *CTALayout);
 }
 
 void BlockedEncodingAttr::print(mlir::AsmPrinter &printer) const {
   printer << "<{"
-          << "sizePerThread = [" << getSizePerThread() << "]"
-          << ", threadsPerWarp = [" << getThreadsPerWarp() << "]"
-          << ", warpsPerCTA = [" << getWarpsPerCTA() << "]"
-          << ", order = [" << getOrder() << "]"
-          << ", CTAsPerCGA = [" << getCTALayout().getCTAsPerCGA() << "]"
-          << ", CTASplitNum = [" << getCTALayout().getCTASplitNum() << "]"
-          << ", CTAOrder = [" << getCTALayout().getCTAOrder() << "]"
-          << "}>";
+          << "sizePerThread = [" << ArrayRef(getSizePerThread()) << "]"
+          << ", threadsPerWarp = [" << ArrayRef(getThreadsPerWarp()) << "]"
+          << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]"
+          << ", order = [" << getOrder() << "]";
+
+  maybePrintCTALayout(getContext(), printer, getCTALayout(),
+                      /*rank=*/getSizePerThread().size());
+
+  printer << "}>";
 }
 
 //===----------------------------------------------------------------------===//
 // MMA encoding
 //===----------------------------------------------------------------------===//
 
-Attribute MmaEncodingAttr::parse(AsmParser &parser, Type type) {
+Attribute NvidiaMmaEncodingAttr::parse(AsmParser &parser, Type type) {
   if (parser.parseLess().failed())
     return {};
   DictionaryAttr dict;
@@ -1328,9 +1178,9 @@ Attribute MmaEncodingAttr::parse(AsmParser &parser, Type type) {
   unsigned versionMajor = 0;
   unsigned versionMinor = 0;
   SmallVector<unsigned> warpsPerCTA;
-  SmallVector<unsigned> CTAsPerCGA;
-  SmallVector<unsigned> CTASplitNum;
-  SmallVector<unsigned> CTAOrder;
+  std::optional<SmallVector<unsigned>> CTAsPerCGA;
+  std::optional<SmallVector<unsigned>> CTASplitNum;
+  std::optional<SmallVector<unsigned>> CTAOrder;
   SmallVector<unsigned> instrShape;
 
   for (const NamedAttribute &attr : dict) {
@@ -1347,15 +1197,18 @@ Attribute MmaEncodingAttr::parse(AsmParser &parser, Type type) {
         return {};
     }
     if (attr.getName() == "CTAsPerCGA") {
-      if (parseIntArrayAttr(parser, attr, CTAsPerCGA, "CTAsPerCGA").failed())
+      if (parseIntArrayAttr(parser, attr, CTAsPerCGA.emplace(), "CTAsPerCGA")
+              .failed())
         return {};
     }
     if (attr.getName() == "CTASplitNum") {
-      if (parseIntArrayAttr(parser, attr, CTASplitNum, "CTASplitNum").failed())
+      if (parseIntArrayAttr(parser, attr, CTASplitNum.emplace(), "CTASplitNum")
+              .failed())
         return {};
     }
     if (attr.getName() == "CTAOrder") {
-      if (parseIntArrayAttr(parser, attr, CTAOrder, "CTAOrder").failed())
+      if (parseIntArrayAttr(parser, attr, CTAOrder.emplace(), "CTAOrder")
+              .failed())
         return {};
     }
     if (attr.getName() == "instrShape") {
@@ -1365,31 +1218,33 @@ Attribute MmaEncodingAttr::parse(AsmParser &parser, Type type) {
     }
   }
 
-  auto CTALayout = CTALayoutAttr::get(parser.getContext(), CTAsPerCGA,
-                                      CTASplitNum, CTAOrder);
+  std::optional<CTALayoutAttr> CTALayout = getCTALayoutOrError(
+      parser, CTAsPerCGA, CTASplitNum, CTAOrder, /*rank=*/warpsPerCTA.size());
+  if (!CTALayout.has_value())
+    return {};
 
-  return parser.getChecked<MmaEncodingAttr>(parser.getContext(), versionMajor,
-                                            versionMinor, warpsPerCTA,
-                                            CTALayout, instrShape);
+  return parser.getChecked<NvidiaMmaEncodingAttr>(
+      parser.getContext(), versionMajor, versionMinor, warpsPerCTA, *CTALayout,
+      instrShape);
 }
 
-void MmaEncodingAttr::print(AsmPrinter &printer) const {
+void NvidiaMmaEncodingAttr::print(AsmPrinter &printer) const {
   printer << "<{"
-          << "versionMajor = " << getVersionMajor() << ", "
-          << "versionMinor = " << getVersionMinor() << ", "
-          << "warpsPerCTA = [" << getWarpsPerCTA() << "], "
-          << "CTAsPerCGA = [" << getCTALayout().getCTAsPerCGA() << "], "
-          << "CTASplitNum = [" << getCTALayout().getCTASplitNum() << "], "
-          << "CTAOrder = [" << getCTALayout().getCTAOrder() << "], "
-          << "instrShape = [" << getInstrShape() << "]"
-          << "}>";
+          << "versionMajor = " << getVersionMajor()
+          << ", versionMinor = " << getVersionMinor() //
+          << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]";
+
+  maybePrintCTALayout(getContext(), printer, getCTALayout(),
+                      /*rank=*/getWarpsPerCTA().size());
+
+  printer << ", instrShape = [" << getInstrShape() << "]}>";
 }
 
 //===----------------------------------------------------------------------===//
 // MFMA encoding
 //===----------------------------------------------------------------------===//
 
-Attribute MfmaEncodingAttr::parse(AsmParser &parser, Type type) {
+Attribute AMDMfmaEncodingAttr::parse(AsmParser &parser, Type type) {
   if (parser.parseLess().failed())
     return {};
   DictionaryAttr dict;
@@ -1403,6 +1258,9 @@ Attribute MfmaEncodingAttr::parse(AsmParser &parser, Type type) {
   SmallVector<unsigned> warpsPerCTA;
   SmallVector<unsigned> instrShape;
   bool isTransposed;
+  std::optional<SmallVector<unsigned>> CTAsPerCGA;
+  std::optional<SmallVector<unsigned>> CTASplitNum;
+  std::optional<SmallVector<unsigned>> CTAOrder;
 
   for (const NamedAttribute &attr : dict) {
     if (attr.getName() == "versionMajor") {
@@ -1425,27 +1283,70 @@ Attribute MfmaEncodingAttr::parse(AsmParser &parser, Type type) {
       if (parseBool(parser, attr, isTransposed, "isTransposed").failed())
         return {};
     }
+    if (attr.getName() == "CTAsPerCGA") {
+      if (parseIntArrayAttr(parser, attr, CTAsPerCGA.emplace(), "CTAsPerCGA")
+              .failed())
+        return {};
+    }
+    if (attr.getName() == "CTASplitNum") {
+      if (parseIntArrayAttr(parser, attr, CTASplitNum.emplace(), "CTASplitNum")
+              .failed())
+        return {};
+    }
+    if (attr.getName() == "CTAOrder") {
+      if (parseIntArrayAttr(parser, attr, CTAOrder.emplace(), "CTAOrder")
+              .failed())
+        return {};
+    }
   }
 
-  return parser.getChecked<MfmaEncodingAttr>(
+  std::optional<CTALayoutAttr> CTALayout = getCTALayoutOrError(
+      parser, CTAsPerCGA, CTASplitNum, CTAOrder, /*rank=*/warpsPerCTA.size());
+  if (!CTALayout.has_value())
+    return {};
+
+  return parser.getChecked<AMDMfmaEncodingAttr>(
       parser.getContext(), versionMajor, versionMinor, warpsPerCTA,
-      instrShape[0], instrShape[1], isTransposed);
+      instrShape[0], instrShape[1], isTransposed, *CTALayout);
 }
 
-void MfmaEncodingAttr::print(AsmPrinter &printer) const {
+void AMDMfmaEncodingAttr::print(AsmPrinter &printer) const {
   printer << "<{"
-          << "versionMajor = " << getVersionMajor() << ", "
-          << "versionMinor = " << getVersionMinor() << ", "
-          << "warpsPerCTA = [" << getWarpsPerCTA() << "], "
-          << "instrShape = [" << getMDim() << ", " << getNDim() << "], "
-          << "isTransposed = " << getIsTransposed() << "}>";
+          << "versionMajor = " << getVersionMajor()                      //
+          << ", versionMinor = " << getVersionMinor()                    //
+          << ", warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]"    //
+          << ", instrShape = [" << ArrayRef{getMDim(), getNDim()} << "]" //
+          << ", isTransposed = " << getIsTransposed();
+  maybePrintCTALayout(getContext(), printer, getCTALayout(),
+                      /*rank=*/getWarpsPerCTA().size());
+  printer << "}>";
+}
+
+LogicalResult
+AMDMfmaEncodingAttr::verify(function_ref<mlir::InFlightDiagnostic()> emitError,
+                            unsigned versionMajor, unsigned versionMinor,
+                            llvm::ArrayRef<unsigned int> warpsPerCTA,
+                            unsigned mDim, unsigned nDim, bool isTransposed,
+                            mlir::triton::gpu::CTALayoutAttr) {
+  if (!(versionMajor >= 0 && versionMajor <= 3)) {
+    return emitError() << "major version must be in the [0, 3] range";
+  }
+  if (versionMinor != 0) {
+    return emitError() << "minor version must be 0";
+  }
+  if (!((mDim == 32 && nDim == 32) || (mDim == 16 && nDim == 16))) {
+    return emitError()
+           << "(M, N) cases other than (32, 32) or (16, 16) unimplemented";
+  }
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
 // WMMA encoding
 //===----------------------------------------------------------------------===//
 
-Attribute WmmaEncodingAttr::parse(AsmParser &parser, Type type) {
+Attribute AMDWmmaEncodingAttr::parse(AsmParser &parser, Type type) {
   if (parser.parseLess().failed())
     return {};
   DictionaryAttr dict;
@@ -1455,21 +1356,47 @@ Attribute WmmaEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
 
   SmallVector<unsigned> warpsPerCTA;
+  std::optional<SmallVector<unsigned>> CTAsPerCGA;
+  std::optional<SmallVector<unsigned>> CTASplitNum;
+  std::optional<SmallVector<unsigned>> CTAOrder;
 
   for (const NamedAttribute &attr : dict) {
     if (attr.getName() == "warpsPerCTA") {
       if (parseIntArrayAttr(parser, attr, warpsPerCTA, "warpsPerCTA").failed())
         return {};
     }
+    if (attr.getName() == "CTAsPerCGA") {
+      if (parseIntArrayAttr(parser, attr, CTAsPerCGA.emplace(), "CTAsPerCGA")
+              .failed())
+        return {};
+    }
+    if (attr.getName() == "CTASplitNum") {
+      if (parseIntArrayAttr(parser, attr, CTASplitNum.emplace(), "CTASplitNum")
+              .failed())
+        return {};
+    }
+    if (attr.getName() == "CTAOrder") {
+      if (parseIntArrayAttr(parser, attr, CTAOrder.emplace(), "CTAOrder")
+              .failed())
+        return {};
+    }
   }
 
-  return parser.getChecked<WmmaEncodingAttr>(
-      parser.getContext(), warpsPerCTA);
+  std::optional<CTALayoutAttr> CTALayout = getCTALayoutOrError(
+      parser, CTAsPerCGA, CTASplitNum, CTAOrder, /*rank=*/warpsPerCTA.size());
+  if (!CTALayout.has_value())
+    return {};
+
+  return parser.getChecked<AMDWmmaEncodingAttr>(parser.getContext(),
+                                                warpsPerCTA, *CTALayout);
 }
 
-void WmmaEncodingAttr::print(AsmPrinter &printer) const {
+void AMDWmmaEncodingAttr::print(AsmPrinter &printer) const {
   printer << "<{"
-          << "warpsPerCTA = [" << getWarpsPerCTA() << "]}>";
+          << "warpsPerCTA = [" << ArrayRef(getWarpsPerCTA()) << "]";
+  maybePrintCTALayout(getContext(), printer, getCTALayout(),
+                      /*rank=*/getWarpsPerCTA().size());
+  printer << "}>";
 }
 
 //===----------------------------------------------------------------------===//
@@ -1484,7 +1411,7 @@ Attribute SliceEncodingAttr::parse(AsmParser &parser, Type type) {
     return {};
   if (parser.parseGreater().failed())
     return {};
-  unsigned dim = attrs.get("dim").cast<IntegerAttr>().getInt();
+  unsigned dim = mlir::cast<IntegerAttr>(attrs.get("dim")).getInt();
   Attribute parent = attrs.get("parent");
   return parser.getChecked<SliceEncodingAttr>(parser.getContext(), dim, parent);
 }
@@ -1513,9 +1440,9 @@ Attribute SharedEncodingAttr::parse(AsmParser &parser, Type type) {
   unsigned perPhase = 0;
   unsigned maxPhase = 0;
   SmallVector<unsigned> order;
-  SmallVector<unsigned> CTAsPerCGA;
-  SmallVector<unsigned> CTASplitNum;
-  SmallVector<unsigned> CTAOrder;
+  std::optional<SmallVector<unsigned>> CTAsPerCGA;
+  std::optional<SmallVector<unsigned>> CTASplitNum;
+  std::optional<SmallVector<unsigned>> CTAOrder;
   bool hasLeadingOffset = false;
 
   for (const NamedAttribute &attr : dict) {
@@ -1532,13 +1459,16 @@ Attribute SharedEncodingAttr::parse(AsmParser &parser, Type type) {
       if (parseIntArrayAttr(parser, attr, order, "order").failed())
         return {};
     } else if (attr.getName() == "CTAsPerCGA") {
-      if (parseIntArrayAttr(parser, attr, CTAsPerCGA, "CTAsPerCGA").failed())
+      if (parseIntArrayAttr(parser, attr, CTAsPerCGA.emplace(), "CTAsPerCGA")
+              .failed())
         return {};
     } else if (attr.getName() == "CTASplitNum") {
-      if (parseIntArrayAttr(parser, attr, CTASplitNum, "CTASplitNum").failed())
+      if (parseIntArrayAttr(parser, attr, CTASplitNum.emplace(), "CTASplitNum")
+              .failed())
         return {};
     } else if (attr.getName() == "CTAOrder") {
-      if (parseIntArrayAttr(parser, attr, CTAOrder, "CTAOrder").failed())
+      if (parseIntArrayAttr(parser, attr, CTAOrder.emplace(), "CTAOrder")
+              .failed())
         return {};
     } else if (attr.getName() == "hasLeadingOffset") {
       if (parseBool(parser, attr, hasLeadingOffset, "hasLeadingOffset")
@@ -1551,43 +1481,414 @@ Attribute SharedEncodingAttr::parse(AsmParser &parser, Type type) {
     }
   }
 
-  auto CTALayout = CTALayoutAttr::get(parser.getContext(), CTAsPerCGA,
-                                      CTASplitNum, CTAOrder);
+  std::optional<CTALayoutAttr> CTALayout = getCTALayoutOrError(
+      parser, CTAsPerCGA, CTASplitNum, CTAOrder, /*rank=*/order.size());
+  if (!CTALayout.has_value())
+    return {};
 
   return parser.getChecked<SharedEncodingAttr>(parser.getContext(), vec,
                                                perPhase, maxPhase, order,
-                                               CTALayout, hasLeadingOffset);
+                                               *CTALayout, hasLeadingOffset);
 }
 
 void SharedEncodingAttr::print(AsmPrinter &printer) const {
   printer << "<{"
-          << "vec = " << getVec() << ", "
-          << "perPhase = " << getPerPhase() << ", "
-          << "maxPhase = " << getMaxPhase() << ", "
-          << "order = [" << getOrder() << "], "
-          << "CTAsPerCGA = [" << getCTALayout().getCTAsPerCGA() << "], "
-          << "CTASplitNum = [" << getCTALayout().getCTASplitNum() << "], "
-          << "CTAOrder = [" << getCTALayout().getCTAOrder() << "], "
-          << "hasLeadingOffset = " << getHasLeadingOffset() << "}>";
+          << "vec = " << getVec() //
+          << ", perPhase = " << getPerPhase()
+          << ", maxPhase = " << getMaxPhase() //
+          << ", order = [" << getOrder() << "]";
+  maybePrintCTALayout(getContext(), printer, getCTALayout(),
+                      /*rank=*/getOrder().size());
+  printer << ", hasLeadingOffset = " << getHasLeadingOffset() << "}>";
+}
+
+//===----------------------------------------------------------------------===//
+// Mfma encoding
+//===----------------------------------------------------------------------===//
+// TODO: there is a lot of common code with MmaEncoding here
+
+SmallVector<unsigned>
+AMDMfmaEncodingAttr::getShapePerCTATile(ArrayRef<int64_t> tensorShape) const {
+  auto warpsPerCTA = getWarpsPerCTA();
+  auto rank = warpsPerCTA.size();
+  SmallVector<unsigned> shapePerCTATile(warpsPerCTA.begin(), warpsPerCTA.end());
+  shapePerCTATile[rank - 1] *= getMDim();
+  shapePerCTATile[rank - 2] *= getNDim();
+  return shapePerCTATile;
+}
+
+SmallVector<unsigned> AMDMfmaEncodingAttr::getCTAsPerCGA() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAsPerCGA());
+}
+SmallVector<unsigned> AMDMfmaEncodingAttr::getCTAOrder() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAOrder());
+}
+SmallVector<unsigned> AMDMfmaEncodingAttr::getCTASplitNum() const {
+  return SmallVector<unsigned>(getCTALayout().getCTASplitNum());
+}
+SmallVector<unsigned> AMDMfmaEncodingAttr::getWarpsPerCTA() const {
+  return SmallVector<unsigned>(getWarpsPerCTA__());
+}
+SmallVector<unsigned> AMDMfmaEncodingAttr::getWarpOrder() const {
+  return ::getWarpOrder(*this);
+}
+SmallVector<unsigned> AMDMfmaEncodingAttr::getThreadOrder() const {
+  return ::getOrder(*this);
+}
+SmallVector<unsigned> AMDMfmaEncodingAttr::getThreadsPerWarp() const {
+  unsigned rows, cols;
+  auto rank = ::getOrder(*this).size();
+  SmallVector<unsigned> res(rank, 1);
+  if (getMDim() == 32) {
+    cols = 2;
+    rows = 32;
+  } else {
+    assert(getMDim() == 16);
+    cols = 4;
+    rows = 16;
+  }
+  if (getIsTransposed()) {
+    res[rank - 1] = cols;
+    res[rank - 2] = rows;
+  } else {
+    res[rank - 1] = rows;
+    res[rank - 2] = cols;
+  }
+  return res;
+}
+
+SmallVector<unsigned> AMDMfmaEncodingAttr::getSizePerThread() const {
+  unsigned rows, cols;
+  auto rank = ::getOrder(*this).size();
+  SmallVector<unsigned> res(rank, 1);
+  if (getMDim() == 32) {
+    rows = 16;
+    cols = 1;
+  } else if (getMDim() == 16) {
+    rows = 4;
+    cols = 1;
+  } else
+    llvm_unreachable("Unexpected mfma non-k dim");
+
+  if (getIsTransposed()) {
+    res[rank - 1] = rows;
+    res[rank - 2] = cols;
+  } else {
+    res[rank - 1] = cols;
+    res[rank - 2] = rows;
+  }
+  return res;
+}
+
+SmallVector<int64_t>
+AMDMfmaEncodingAttr::getMFMAInstrShapeForOperands(int kWidth, int opIdx) const {
+  unsigned mDim = getMDim();
+  unsigned nDim = getNDim();
+  assert((mDim == nDim) && (mDim == 32 || mDim == 16 || mDim == 4) ||
+         (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
+  constexpr int warpSize = 64; // MFMA is always based on the 64-wide warps.
+  int kGroups = -1;
+  if (mDim == nDim)
+    kGroups = warpSize / mDim;
+  if (mDim == 64 && nDim == 4 || mDim == 4 && nDim == 64)
+    kGroups = 1;
+  int64_t kDim = kWidth * kGroups;
+  if (opIdx == 0)
+    return {mDim, kDim};
+  else
+    assert(opIdx == 1);
+  return {kDim, nDim};
+}
+
+SmallVector<int64_t>
+AMDMfmaEncodingAttr::getMFMARepForOperands(ArrayRef<int64_t> operandShape,
+                                           int kWidth, int opIdx) const {
+  auto operandTileShape = getMFMAInstrShapeForOperands(kWidth, opIdx);
+  auto rank = operandShape.size();
+  auto warpsPerCTA = getWarpsPerCTA();
+  int numRepBatch =
+      rank == 3 ? std::max<int64_t>(1, operandShape[0] / warpsPerCTA[0]) : 1;
+  if (opIdx == 0)
+    return {
+        numRepBatch,
+        std::max<int64_t>(1, operandShape[rank - 2] /
+                                 (operandTileShape[0] * warpsPerCTA[rank - 2])),
+        std::max<int64_t>(1, operandShape[rank - 1] / operandTileShape[1])};
+  else {
+    assert(opIdx == 1);
+    return {
+        numRepBatch,
+        std::max<int64_t>(1, operandShape[rank - 2] / operandTileShape[0]),
+        std::max<int64_t>(1, operandShape[rank - 1] / (operandTileShape[1] *
+                                                       warpsPerCTA[rank - 1]))};
+  }
+}
+
+unsigned AMDMfmaEncodingAttr::getTotalElemsPerThreadForOperands(
+    ArrayRef<int64_t> shape, Type eltTy, int kWidth, int opIdx) const {
+  auto rep = getMFMARepForOperands(shape, kWidth, opIdx);
+  return product(rep) * kWidth;
+}
+
+SmallVector<unsigned>
+AMDMfmaEncodingAttr::getSizePerThreadForOperands(unsigned opIdx) const {
+  if (opIdx == 0) {
+    return {4, 1};
+  } else if (opIdx == 1) {
+    return {1, 4};
+  } else {
+    llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
+    return {};
+  }
+}
+
+SmallVector<unsigned>
+AMDMfmaEncodingAttr::getShapePerCTATileForDotOperands(ArrayRef<int64_t> shape,
+                                                      int opIdx) const {
+  assert(getMDim() == 32 || getMDim() == 16);
+  auto parentShapePerCTATile = getShapePerCTATile(shape);
+  auto rank = parentShapePerCTATile.size();
+  if (opIdx == 0) {
+    if (rank == 2)
+      return {parentShapePerCTATile[rank - 2], 32};
+    else
+      return {parentShapePerCTATile[0], parentShapePerCTATile[rank - 2], 32};
+  } else if (opIdx == 1) {
+    if (rank == 2)
+      return {32, parentShapePerCTATile[rank - 1]};
+    else
+      return {parentShapePerCTATile[0], 32, parentShapePerCTATile[rank - 1]};
+  } else {
+    llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
+  }
+  llvm_unreachable("DotOperandEncodingAttr opIdx must be 0 or 1");
+}
+
+SmallVector<unsigned>
+AMDWmmaEncodingAttr::getShapePerCTATile(ArrayRef<int64_t> tensorShape) const {
+  auto warpsPerCTA = getWarpsPerCTA();
+  auto rank = warpsPerCTA.size();
+  SmallVector<unsigned> shapePerCTATile(warpsPerCTA.begin(), warpsPerCTA.end());
+
+  auto mnkDim = getMNKDimPerWMMAInstr();
+  shapePerCTATile[rank - 2] *= mnkDim[0];
+  shapePerCTATile[rank - 1] *= mnkDim[1];
+  return shapePerCTATile;
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getCTAsPerCGA() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAsPerCGA());
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getCTAOrder() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAOrder());
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getCTASplitNum() const {
+  return SmallVector<unsigned>(getCTALayout().getCTASplitNum());
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getWarpsPerCTA() const {
+  return SmallVector<unsigned>(getWarpsPerCTA__());
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getWarpOrder() const {
+  return ::getWarpOrder(*this);
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getThreadOrder() const {
+  return ::getOrder(*this);
+}
+SmallVector<unsigned> AMDWmmaEncodingAttr::getThreadsPerWarp() const {
+  auto rank = getWarpsPerCTA().size();
+  SmallVector<unsigned> threads(rank, 1);
+  auto mnkInstr = getMNKDimPerWMMAInstr();
+  threads[rank - 2] = mnkInstr[0] / getSizePerThread()[rank - 2];
+  threads[rank - 1] = mnkInstr[1] / getSizePerThread()[rank - 1];
+  return threads;
+}
+
+SmallVector<unsigned> AMDWmmaEncodingAttr::getSizePerThread() const {
+  auto rank = getWarpsPerCTA().size();
+  SmallVector<unsigned> sizePerThread(rank, 1);
+  sizePerThread[rank - 2] = 8;
+  sizePerThread[rank - 1] = 1;
+  return sizePerThread;
+}
+SmallVector<unsigned>
+AMDWmmaEncodingAttr::getSizePerThreadForOperands(unsigned opIdx) const {
+  auto rank = getWarpsPerCTA().size();
+  SmallVector<unsigned> sizePerThread(rank, 1);
+  if (opIdx == 0) {
+    sizePerThread[rank - 2] = 1;
+    sizePerThread[rank - 1] = 16;
+  } else if (opIdx == 1) {
+    sizePerThread[rank - 2] = 16;
+    sizePerThread[rank - 1] = 1;
+  } else {
+    llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
+  }
+  return sizePerThread;
+}
+
+SmallVector<unsigned>
+AMDWmmaEncodingAttr::getShapePerCTATileForDotOperands(ArrayRef<int64_t> shape,
+                                                      int opIdx) const {
+  auto parentShapePerCTA = getShapePerCTATile(shape);
+  auto rank = shape.size();
+  assert(rank = 2);
+  if (opIdx == 0) {
+    return {parentShapePerCTA[0], static_cast<unsigned>(shape[1])};
+  } else if (opIdx == 1) {
+    return {static_cast<unsigned>(shape[0]), parentShapePerCTA[1]};
+  } else {
+    llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
+  }
+}
+
+unsigned AMDWmmaEncodingAttr::getTotalElemsPerThreadForOperands(
+    ArrayRef<int64_t> shape, Type eltTy, int kWidth, int opIdx) const {
+  auto rep = getWMMARepForOperands(shape, eltTy, kWidth, opIdx);
+  return product(rep) * kWidth;
+}
+
+SmallVector<int64_t>
+AMDWmmaEncodingAttr::getWMMAElemsPerInstrForOperands() const {
+  return {16, 16};
+}
+
+SmallVector<int64_t>
+AMDWmmaEncodingAttr::getWMMARepForOperands(ArrayRef<int64_t> operandShape,
+                                           Type elemType, int kWidth,
+                                           int opIdx) const {
+  auto operandTileShape = getWMMAElemsPerInstrForOperands();
+  assert(operandTileShape.size() == 2);
+  auto warpsPerCTA = getWarpsPerCTA();
+  auto rank = operandShape.size();
+  assert(rank == 2 || rank == 3);
+  int numRepBatch =
+      rank == 3 ? std::max<int64_t>(1, operandShape[0] / warpsPerCTA[0]) : 1;
+  if (opIdx == 0)
+    return {
+        numRepBatch,
+        std::max<int64_t>(1, operandShape[rank - 2] /
+                                 (operandTileShape[0] * warpsPerCTA[rank - 2])),
+        std::max<int64_t>(1, operandShape[rank - 1] / operandTileShape[1])};
+  else {
+    assert(opIdx == 1);
+    return {
+        numRepBatch,
+        std::max<int64_t>(1, operandShape[rank - 2] / operandTileShape[0]),
+        std::max<int64_t>(1, operandShape[rank - 1] / (operandTileShape[1] *
+                                                       warpsPerCTA[rank - 1]))};
+  }
+}
+
+SmallVector<unsigned> AMDWmmaEncodingAttr::getMNKDimPerWMMAInstr() {
+  // TODO: move magic numbers out of the code
+  return {16, 16, 16};
 }
 
 //===----------------------------------------------------------------------===//
 // Mma encoding
 //===----------------------------------------------------------------------===//
 
-bool MmaEncodingAttr::isVolta() const { return getVersionMajor() == 1; }
+bool NvidiaMmaEncodingAttr::isVolta() const { return getVersionMajor() == 1; }
 
-bool MmaEncodingAttr::isTuring() const {
+bool NvidiaMmaEncodingAttr::isTuring() const {
   return getVersionMajor() == 2 && getVersionMinor() == 1;
 }
 
-bool MmaEncodingAttr::isAmpere() const { return getVersionMajor() == 2; }
+bool NvidiaMmaEncodingAttr::isAmpere() const { return getVersionMajor() == 2; }
 
-bool MmaEncodingAttr::isHopper() const { return getVersionMajor() == 3; }
+bool NvidiaMmaEncodingAttr::isHopper() const { return getVersionMajor() == 3; }
+
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getCTAsPerCGA() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAsPerCGA());
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getCTAOrder() const {
+  return SmallVector<unsigned>(getCTALayout().getCTAOrder());
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getCTASplitNum() const {
+  return SmallVector<unsigned>(getCTALayout().getCTASplitNum());
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getWarpsPerCTA() const {
+  return SmallVector<unsigned>(getWarpsPerCTA__());
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getWarpOrder() const {
+  return ::getWarpOrder(*this);
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getThreadsPerWarp() const {
+  auto rank = getWarpsPerCTA().size();
+  SmallVector<unsigned> res(rank, 1);
+  if (isVolta()) {
+    res[rank - 2] = 4;
+    res[rank - 1] = 8;
+    return res;
+  }
+  if (isAmpere()) {
+    res[rank - 2] = 8;
+    res[rank - 1] = 4;
+    return res;
+  }
+  if (isHopper()) {
+    res[rank - 2] = 8;
+    res[rank - 1] = 4;
+    return res;
+  }
+  llvm::report_fatal_error(
+      "getThreadsPerWarp not implemented for unknown Mma version ");
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getThreadOrder() const {
+  return ::getOrder(*this);
+}
+SmallVector<unsigned> NvidiaMmaEncodingAttr::getSizePerThread() const {
+  auto rank = ::getOrder(*this).size();
+  SmallVector<unsigned> res(rank, 1);
+  if (isAmpere()) {
+    res[rank - 2] = 2;
+    res[rank - 1] = 2;
+    return res;
+  }
+  if (isVolta()) {
+    res[rank - 2] = 1;
+    res[rank - 1] = 2;
+    return res;
+  }
+  if (isHopper()) {
+    auto instrShape = getInstrShape();
+    // WGMMA instructions have an order of [0, 1] with 4 warps, each with 8
+    // unique thread ids (32 in a warp group) per column. It is 1 warp wide with
+    // 4 unique thread ids in the row. So the size per thread is the instruction
+    // size divided by the number of unique thread ids.
+    return SmallVector<unsigned>{instrShape[0] * 4 / 32, instrShape[1] / 4};
+  }
+  llvm_unreachable("Unexpected mma version");
+}
+
+SmallVector<unsigned>
+NvidiaMmaEncodingAttr::getShapePerCTATile(ArrayRef<int64_t> tensorShape) const {
+  if (isAmpere()) {
+    auto warpsPerCTA = getWarpsPerCTA();
+    auto rank = warpsPerCTA.size();
+    SmallVector<unsigned> shapePerCTATile(warpsPerCTA.begin(),
+                                          warpsPerCTA.end());
+    shapePerCTATile[rank - 1] *= 8;
+    shapePerCTATile[rank - 2] *= 16;
+    return shapePerCTATile;
+  }
+  if (isVolta()) {
+    assert(!tensorShape.empty() && "Volta needs the tensorShape");
+    if (tensorShape.size() == 1) // must be SliceEncoding
+      return {static_cast<unsigned>(tensorShape[0]),
+              static_cast<unsigned>(tensorShape[0])};
+    return {static_cast<unsigned>(tensorShape[0]),
+            static_cast<unsigned>(tensorShape[1])};
+  }
+  if (isHopper()) {
+    auto instrShape = getInstrShape();
+    return {16 * getWarpsPerCTA()[0], instrShape[1] * getWarpsPerCTA()[1]};
+  }
+  llvm::report_fatal_error("Unexpected MMA layout version found");
+}
 
 // Get [isARow, isBRow, isAVec4, isBVec4, id] from versionMinor
 std::tuple<bool, bool, bool, bool, int>
-MmaEncodingAttr::decodeVoltaLayoutStates() const {
+NvidiaMmaEncodingAttr::decodeVoltaLayoutStates() const {
   unsigned versionMinor = getVersionMinor();
   bool isARow = versionMinor & (1 << 0);
   bool isBRow = versionMinor & (1 << 1);
@@ -1601,62 +1902,29 @@ MmaEncodingAttr::decodeVoltaLayoutStates() const {
   return std::make_tuple(isARow, isBRow, isAVec4, isBVec4, id);
 }
 
-//===----------------------------------------------------------------------===//
-// DotOperand Encoding
-//===----------------------------------------------------------------------===//
-Attribute DotOperandEncodingAttr::parse(AsmParser &parser, Type type) {
-  if (parser.parseLess().failed())
-    return {};
-  NamedAttrList attrs;
-  if (parser.parseOptionalAttrDict(attrs).failed())
-    return {};
-  if (parser.parseGreater().failed())
-    return {};
-  unsigned opIdx = attrs.get("opIdx").cast<IntegerAttr>().getInt();
-  Attribute parent = attrs.get("parent");
-  auto mmaParent = parent.dyn_cast<MmaEncodingAttr>();
-  unsigned kWidth = 0;
-  Attribute _kWidth = attrs.get("kWidth");
-  if (_kWidth) {
-#ifndef USE_ROCM
-    if (!mmaParent || mmaParent.isVolta()) {
-      auto loc = parser.getNameLoc();
-      parser.emitError(loc, "kWidth only supported for MMAv2+ parent");
-      return Attribute();
-    }
-#endif
-    kWidth = _kWidth.cast<IntegerAttr>().getInt();
+bool NvidiaMmaEncodingAttr::getMMAv1IsRow(int opIdx) const {
+  auto [isARow, isBRow, _0, _1, _2] = decodeVoltaLayoutStates();
+  return opIdx == 0 ? isARow : isBRow;
+}
+bool NvidiaMmaEncodingAttr::getMMAv1IsVec4(int opIdx) const {
+  auto [_0, _1, isAVec4, isBVec4, _2] = decodeVoltaLayoutStates();
+  return opIdx == 0 ? isAVec4 : isBVec4;
+}
+int NvidiaMmaEncodingAttr::getMMAv1NumOuter(ArrayRef<int64_t> shape,
+                                            int opIdx) const {
+  auto spw = getMMAv1ShapePerWarp(opIdx);
+  auto rep = getMMAv1Rep(opIdx);
+  auto warpsPerCTA = getWarpsPerCTA();
+  if (opIdx == 0) {
+    return rep[0] * shape[0] / (spw[0] * warpsPerCTA[0]);
+  } else {
+    return rep[1] * shape[1] / (spw[1] * warpsPerCTA[1]);
   }
-  return parser.getChecked<DotOperandEncodingAttr>(parser.getContext(), opIdx,
-                                                   parent, kWidth);
 }
-
-void DotOperandEncodingAttr::print(mlir::AsmPrinter &printer) const {
-  auto mmaParent = getParent().dyn_cast<MmaEncodingAttr>();
-  printer << "<{"
-          << "opIdx = " << getOpIdx() << ", parent = " << getParent();
-  if ((mmaParent && mmaParent.isAmpere()) || getParent().isa<MfmaEncodingAttr>())
-    printer << ", kWidth = " << getKWidth();
-  printer << "}>";
-}
-
-bool DotOperandEncodingAttr::getMMAv1IsRow() const {
-  auto [isARow, isBRow, _0, _1, _2] =
-      getParent().cast<MmaEncodingAttr>().decodeVoltaLayoutStates();
-  return getOpIdx() == 0 ? isARow : isBRow;
-}
-
-bool DotOperandEncodingAttr::getMMAv1IsVec4() const {
-  auto [_0, _1, isAVec4, isBVec4, _2] =
-      getParent().cast<MmaEncodingAttr>().decodeVoltaLayoutStates();
-  return getOpIdx() == 0 ? isAVec4 : isBVec4;
-}
-
-SmallVector<int> DotOperandEncodingAttr::getMMAv1Rep() const {
-  auto [isARow, isBRow, isAVec4, isBVec4, _] =
-      getParent().cast<MmaEncodingAttr>().decodeVoltaLayoutStates();
+SmallVector<int> NvidiaMmaEncodingAttr::getMMAv1Rep(int opIdx) const {
+  auto [isARow, isBRow, isAVec4, isBVec4, _] = decodeVoltaLayoutStates();
   // A
-  if (getOpIdx() == 0) {
+  if (opIdx == 0) {
     int packSize = (isARow || isAVec4) ? 1 : 2;
     return {2 * packSize, 0, 1};
   }
@@ -1666,107 +1934,172 @@ SmallVector<int> DotOperandEncodingAttr::getMMAv1Rep() const {
     return {0, 2 * packSize, 1};
   }
 }
-
-SmallVector<int> DotOperandEncodingAttr::getMMAv1ShapePerWarp() const {
-  auto rep = getMMAv1Rep();
-  if (getOpIdx() == 0) {
+SmallVector<int> NvidiaMmaEncodingAttr::getMMAv1ShapePerWarp(int opIdx) const {
+  auto rep = getMMAv1Rep(opIdx);
+  if (opIdx == 0) {
     return {8 * rep[0], 0, 1};
   } else {
     return {0, 8 * rep[1], 1};
   }
 }
-
-int DotOperandEncodingAttr::getMMAv1Vec() const {
-  size_t opIdx = getOpIdx();
-  return 2 * getMMAv1Rep()[opIdx];
+int NvidiaMmaEncodingAttr::getMMAv1Vec(int opIdx) const {
+  return 2 * getMMAv1Rep(opIdx)[opIdx];
 }
+SmallVector<int64_t> NvidiaMmaEncodingAttr::getMMAv2Rep(ArrayRef<int64_t> shape,
+                                                        int bitwidth,
+                                                        int opIdx) const {
+  auto rank = shape.size();
+  auto warpsPerCTA = getWarpsPerCTA();
+  SmallVector<int> shapePerWarp = {1, 16, 8, 4 * 64 / bitwidth};
+  int numRepBatch =
+      rank == 3
+          ? std::max<int64_t>(1, shape[0] / (shapePerWarp[0] * warpsPerCTA[0]))
+          : 1;
+  assert(isAmpere());
 
-int DotOperandEncodingAttr::getMMAv1NumOuter(ArrayRef<int64_t> shape) const {
-  auto spw = getMMAv1ShapePerWarp();
-  auto rep = getMMAv1Rep();
-  auto warpsPerCTA = getParent().cast<MmaEncodingAttr>().getWarpsPerCTA();
-  if (getOpIdx() == 0) {
-    return rep[0] * shape[0] / (spw[0] * warpsPerCTA[0]);
+  if (opIdx == 0)
+    return {numRepBatch,
+            std::max<int64_t>(1, shape[rank - 2] /
+                                     (shapePerWarp[1] * warpsPerCTA[rank - 2])),
+            std::max<int64_t>(1, shape[rank - 1] / shapePerWarp[3])};
+  else {
+    assert(opIdx == 1);
+    return {numRepBatch,
+            std::max<int64_t>(1, shape[rank - 2] / shapePerWarp[3]),
+            std::max<int64_t>(1, shape[rank - 1] / (shapePerWarp[2] *
+                                                    warpsPerCTA[rank - 1]))};
+  }
+}
+unsigned NvidiaMmaEncodingAttr::getTotalElemsPerThreadForOperands(
+    ArrayRef<int64_t> shape, Type eltTy, int kWidth, int opIdx) const {
+  auto shapePerCTA = getShapePerCTA(*this, shape);
+  int warpsPerCTAM = getWarpsPerCTA()[0];
+  int warpsPerCTAN = getWarpsPerCTA()[1];
+  // H100
+  if (isHopper()) {
+    return getTotalElemsPerThread(shape, eltTy);
+  }
+  // A100
+  if (isAmpere()) {
+    auto rep = getMMAv2Rep(shapePerCTA, eltTy.getIntOrFloatBitWidth(), opIdx);
+    if (opIdx == 0)
+      return 4 * rep[0] * rep[1] * rep[2];
+    if (opIdx == 1)
+      return 4 * rep[0] * rep[1] * std::max<int>(rep[2] / 2, 1);
+  }
+  // V100
+  if (isVolta()) {
+    bool isRow = getMMAv1IsRow(opIdx);
+    bool isVec4 = getMMAv1IsVec4(opIdx);
+    if (opIdx == 0) {
+      int packSizeM = (isRow || isVec4) ? 1 : 2;
+      int repM = 2 * packSizeM;
+      int spwM = 2 * 4 * repM;
+      int numM = getMMAv1NumOuter(shape, opIdx);
+      int NK = shape[1];
+      int vec = 2 * repM;
+      // Here we mimic the logic in loadA, the result cannot be calculated
+      // directly.
+      llvm::DenseSet<std::pair<int, int>> visited;
+      auto ld = [&](int m, int k) {
+        visited.insert({m, k});
+        if (vec > 4) {
+          if (isRow)
+            visited.insert({m, k + 4});
+          else
+            visited.insert({m + 1, k});
+        }
+      };
+      for (unsigned k = 0; k < NK; k += 4)
+        for (unsigned m = 0; m < numM / 2; ++m)
+          if (!visited.count({m, k}))
+            ld(m, k);
+      return visited.size() * 2;
+    }
+    if (opIdx == 1) {
+      int packSizeN = (isRow && !isVec4) ? 2 : 1;
+      int repN = 2 * packSizeN;
+      int spwN = 2 * 4 * repN;
+      int numN = getMMAv1NumOuter(shape, opIdx);
+      int vec = 2 * repN;
+
+      int NK = shape[0];
+      // Here we mimic the logic in loadA, the result cannot be calculated
+      // directly.
+      llvm::DenseSet<std::pair<int, int>> visited;
+      int elemsPerLd = vec > 4 ? 4 : 2;
+      auto ld = [&](int n, int k) {
+        visited.insert({n, k});
+        if (vec > 4) {
+          if (isRow)
+            visited.insert({n + 1, k});
+          else
+            visited.insert({n, k + 4});
+        }
+      };
+
+      for (unsigned k = 0; k < NK; k += 4)
+        for (unsigned n = 0; n < numN / 2; ++n) {
+          if (!visited.count({n, k}))
+            ld(n, k);
+        }
+
+      return visited.size() * 2;
+    }
+  }
+  llvm_unreachable("unknown mma layout");
+}
+SmallVector<unsigned>
+NvidiaMmaEncodingAttr::getShapePerCTATileForDotOperands(ArrayRef<int64_t> shape,
+                                                        int opIdx) const {
+  assert(isAmpere() && "mmaLayout version = 1 is not implemented yet");
+  auto parentShapePerCTATile = getShapePerCTATile(shape);
+  auto rank = parentShapePerCTATile.size();
+  if (opIdx == 0) {
+    if (rank == 2)
+      return {parentShapePerCTATile[rank - 2], 16};
+    else
+      return {parentShapePerCTATile[0], parentShapePerCTATile[rank - 2], 16};
+  } else if (opIdx == 1) {
+    if (rank == 2)
+      return {16, parentShapePerCTATile[rank - 1]};
+    else
+      return {parentShapePerCTATile[0], 16, parentShapePerCTATile[rank - 1]};
   } else {
-    return rep[1] * shape[1] / (spw[1] * warpsPerCTA[1]);
+    llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
+  }
+}
+SmallVector<unsigned>
+NvidiaMmaEncodingAttr::getSizePerThreadForOperands(unsigned opIdx) const {
+  assert(isAmpere() && "mmaLayout version = 1 is not implemented yet");
+  if (opIdx == 0) {
+    return {2, 4};
+  } else if (opIdx == 1) {
+    return {4, 1};
+  } else {
+    llvm::report_fatal_error("DotOperandEncodingAttr opIdx must be 0 or 1");
+    return {};
   }
 }
 
 //===----------------------------------------------------------------------===//
-// InsertSliceOp / InsertSliceAsyncOp
+// DotOperand Encoding
 //===----------------------------------------------------------------------===//
-
-template <class OpT>
-ParseResult parseInsertSliceOp(OpAsmParser &parser, OperationState &result) {
-  SmallVector<OpAsmParser::UnresolvedOperand, 8> allOperands;
-  Type srcType, dstType;
-  SMLoc allOperandLoc = parser.getCurrentLocation();
-  if (parser.parseOperandList(allOperands) ||
-      parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
-      parser.parseCustomTypeWithFallback(srcType) || parser.parseArrow() ||
-      parser.parseCustomTypeWithFallback(dstType))
-    return failure();
-  result.addTypes(dstType);
-
-  SmallVector<Type> operandTypes;
-  operandTypes.push_back(srcType); // src
-  operandTypes.push_back(dstType); // dst
-  operandTypes.push_back(
-      IntegerType::get(parser.getBuilder().getContext(), 32)); // index
-
-  int hasMask = 0, hasOther = 0;
-  if (allOperands.size() >= 4) {
-    operandTypes.push_back(
-        triton::getI1SameShapeFromTensorOrTensorPtr(srcType)); // mask
-    hasMask = 1;
+SmallVector<unsigned> DotOperandEncodingAttr::getThreadsPerWarp() const {
+  llvm::report_fatal_error(
+      "getThreadsPerWarp not implemented for DotOperandEncodingAttr");
+}
+SmallVector<unsigned> DotOperandEncodingAttr::getSizePerThread() const {
+  auto parentLayout = getParent();
+  assert(parentLayout && "DotOperandEncodingAttr must have a parent");
+  if (auto parentMmaLayout = mlir::dyn_cast<MmaEncodingTrait>(parentLayout)) {
+    return parentMmaLayout.getSizePerThreadForOperands(getOpIdx());
+  } else {
+    llvm::report_fatal_error(
+        "DotOperandEncodingAttr non-NvidiaMmaEncodingAttr parent not "
+        "supported yet");
+    return {};
   }
-  if (allOperands.size() >= 5) {
-    operandTypes.push_back(triton::getPointeeType(srcType)); // other
-    hasOther = 1;
-  }
-
-  if (parser.resolveOperands(allOperands, operandTypes, allOperandLoc,
-                             result.operands))
-    return failure();
-
-  // Deduce operandSegmentSizes from the number of the operands.
-  auto operandSegmentSizesAttrName =
-      OpT::getOperandSegmentSizesAttrName(result.name);
-  result.addAttribute(
-      operandSegmentSizesAttrName,
-      parser.getBuilder().getDenseI32ArrayAttr({1, 1, 1, hasMask, hasOther}));
-  return success();
-}
-
-template <class OpT>
-void printInsertSliceOp(OpAsmPrinter &printer, OpT insertSliceOp) {
-  printer << " ";
-  printer << insertSliceOp.getOperation()->getOperands();
-  // "operandSegmentSizes" can be deduced, so we don't print it.
-  printer.printOptionalAttrDict(
-      insertSliceOp->getAttrs(),
-      {insertSliceOp.getOperandSegmentSizesAttrName()});
-  printer << " : ";
-  printer.printStrippedAttrOrType(insertSliceOp.getSrc().getType());
-  printer << " -> ";
-  printer.printStrippedAttrOrType(insertSliceOp.getDst().getType());
-}
-
-ParseResult InsertSliceOp::parse(OpAsmParser &parser, OperationState &result) {
-  return parseInsertSliceOp<InsertSliceOp>(parser, result);
-}
-
-void InsertSliceOp::print(OpAsmPrinter &printer) {
-  printInsertSliceOp<InsertSliceOp>(printer, *this);
-}
-
-ParseResult InsertSliceAsyncOp::parse(OpAsmParser &parser,
-                                      OperationState &result) {
-  return parseInsertSliceOp<InsertSliceAsyncOp>(parser, result);
-}
-
-void InsertSliceAsyncOp::print(OpAsmPrinter &printer) {
-  printInsertSliceOp<InsertSliceAsyncOp>(printer, *this);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1778,19 +2111,16 @@ public:
   using OpAsmDialectInterface::OpAsmDialectInterface;
 
   AliasResult getAlias(Attribute attr, raw_ostream &os) const override {
-    if (auto mmaAttr = attr.dyn_cast<MmaEncodingAttr>()) {
+    if (auto mmaAttr = mlir::dyn_cast<MmaEncodingTrait>(attr)) {
       os << "mma";
       return AliasResult::FinalAlias;
-    } else if (attr.isa<MfmaEncodingAttr>()) {
-      os << "mfma";
-      return AliasResult::FinalAlias;
-    } else if (auto sharedAttr = attr.dyn_cast<SharedEncodingAttr>()) {
+    } else if (auto sharedAttr = mlir::dyn_cast<SharedEncodingAttr>(attr)) {
       os << "shared";
       return AliasResult::FinalAlias;
-    } else if (auto blockedAttr = attr.dyn_cast<BlockedEncodingAttr>()) {
+    } else if (auto blockedAttr = mlir::dyn_cast<BlockedEncodingAttr>(attr)) {
       os << "blocked";
       return AliasResult::FinalAlias;
-    } /* else if (auto sliceAttr = attr.dyn_cast<SliceEncodingAttr>()) {
+    } /* else if (auto sliceAttr = dyn_cast<SliceEncodingAttr>(attr)) {
       os << "slice";
       return AliasResult::FinalAlias;
     } */
@@ -1810,29 +2140,109 @@ struct TritonGPUInferLayoutInterface
     return success();
   }
 
+  // Infer the encoding of a tt.trans(x) given the encoding of x.
+  //
+  // Our goal is to choose an encoding so that the trans is a "nop".  For
+  // example, in a blocked encoding, the same GPU threads hold the same
+  // elements, they're just "renamed" -- what was element [i,j] of the tensor is
+  // now element [j,i], but that element is held by the same GPU thread.
+  //
+  // For most properties of the encoding, we let
+  //   outputEnc.prop = inputEnc.prop * trans.order,
+  // where `x * y` means we apply permutation y to x.
+  //
+  // This works because prop[i] tells you something about the i'th dimension of
+  // the tensor. (For example, sizePerThread[2] == 4 means that one GPU thread
+  // contains 4 elements along dim 2 of the tensor.) The transpose reorders the
+  // dimensions according to the perm trans.order, so we achieve our goal of
+  // having a "nop" transpose by reordering the values in the prop the same way.
+  //
+  // The big exception to this is the encoding's `order`.
+  //
+  // An encoding's order is a list of dimensions, from fastest moving (most
+  // minor) to slowest moving.  Thus enc.order[i] does not tell you something
+  // about the i'th dimension of the tensor, and it would be disasterously
+  // incorrect to do enc.order * trans.order.
+  //
+  // But!  If we invert enc.order, it *does* meet this criterion.  For example,
+  // if enc.order = [2,0,1], inverse(enc.order) = [1,2,0].  If you stare at it,
+  // you'll see that inverse(enc.order)[i] == j means that dimension i is the
+  // j'th most minor.  Therefore we can safely permute *this* by trans.order.
+  //
+  // Thus we have
+  //
+  //   outputEnc.order = inverse(inverse(inputEnc.order) * trans.order)
+  //                   = inverse(trans.order) * inputEnc.order.
+  //
   LogicalResult inferTransOpEncoding(Attribute operandEncoding,
+                                     ArrayRef<int32_t> order, // trans order
                                      Attribute &resultEncoding) const override {
-    SharedEncodingAttr sharedEncoding =
-        operandEncoding.dyn_cast<SharedEncodingAttr>();
-    if (!sharedEncoding)
-      return failure();
-    SmallVector<unsigned> retOrder(sharedEncoding.getOrder().begin(),
-                                   sharedEncoding.getOrder().end());
-    std::reverse(retOrder.begin(), retOrder.end());
-    // TODO(Qingyi): Need to check whether CTAOrder should also be reversed.
-    // This is not a problem for tests where numCTAs = 1.
-    resultEncoding = SharedEncodingAttr::get(
-        getDialect()->getContext(), sharedEncoding.getVec(),
-        sharedEncoding.getPerPhase(), sharedEncoding.getMaxPhase(), retOrder,
-        sharedEncoding.getCTALayout(), sharedEncoding.getHasLeadingOffset());
-    return mlir::success();
+    // Note: inferFooOpEncoding should not crash if given invalid inputs, which
+    // happens when someone creates invalid IR.  If we return failure() on
+    // error, then MLIR will generate a helpful error message.
+
+    auto invOrder = inversePermutation(order);
+    SmallVector<unsigned> invOrderUnsigned(invOrder.begin(), invOrder.end());
+
+    auto permuteCTALayout =
+        [&](const CTALayoutAttr &layout) -> FailureOr<CTALayoutAttr> {
+      auto n = order.size();
+      if (layout.getCTAsPerCGA().size() != n ||
+          layout.getCTASplitNum().size() != n ||
+          layout.getCTAOrder().size() != n) {
+        return failure();
+      }
+
+      return CTALayoutAttr::get(
+          getDialect()->getContext(),
+          applyPermutation(layout.getCTAsPerCGA(), order),
+          applyPermutation(layout.getCTASplitNum(), order),
+          applyPermutation(invOrderUnsigned, layout.getCTAOrder()));
+    };
+
+    if (auto enc = mlir::dyn_cast<SharedEncodingAttr>(operandEncoding)) {
+      if (enc.getOrder().size() != order.size()) {
+        return failure();
+      }
+      FailureOr<CTALayoutAttr> ctaLayout = permuteCTALayout(enc.getCTALayout());
+      if (failed(ctaLayout)) {
+        return failure();
+      }
+      resultEncoding = SharedEncodingAttr::get(
+          getDialect()->getContext(), enc.getVec(), enc.getPerPhase(),
+          enc.getMaxPhase(), applyPermutation(invOrderUnsigned, enc.getOrder()),
+          *ctaLayout, enc.getHasLeadingOffset());
+      return success();
+    }
+
+    if (auto enc = mlir::dyn_cast<BlockedEncodingAttr>(operandEncoding)) {
+      auto n = order.size();
+      if (enc.getSizePerThread().size() != n ||
+          enc.getThreadsPerWarp().size() != n ||
+          enc.getWarpsPerCTA().size() != n || enc.getOrder().size() != n) {
+        return failure();
+      }
+      FailureOr<CTALayoutAttr> ctaLayout = permuteCTALayout(enc.getCTALayout());
+      if (failed(ctaLayout)) {
+        return failure();
+      }
+      resultEncoding = BlockedEncodingAttr::get(
+          getDialect()->getContext(),
+          applyPermutation(enc.getSizePerThread(), order),
+          applyPermutation(enc.getThreadsPerWarp(), order),
+          applyPermutation(enc.getWarpsPerCTA(), order),
+          applyPermutation(invOrderUnsigned, enc.getOrder()), *ctaLayout);
+      return success();
+    }
+
+    return failure(); // unhandled encoding
   }
 
   LogicalResult
   inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
                             Attribute &resultEncoding,
                             std::optional<Location> location) const override {
-    auto sliceEncoding = operandEncoding.dyn_cast<SliceEncodingAttr>();
+    auto sliceEncoding = mlir::dyn_cast<SliceEncodingAttr>(operandEncoding);
     if (!sliceEncoding)
       return emitOptionalError(
           location, "ExpandDimsOp operand encoding must be SliceEncodingAttr");
@@ -1847,17 +2257,17 @@ struct TritonGPUInferLayoutInterface
   inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                      Attribute retEncoding,
                      std::optional<Location> location) const override {
-    auto mmaRetEncoding = retEncoding.dyn_cast<MmaEncodingAttr>();
+    auto mmaRetEncoding = mlir::dyn_cast<NvidiaMmaEncodingAttr>(retEncoding);
     if (mmaRetEncoding && mmaRetEncoding.isHopper()) {
-      auto dotOpEnc = operandEncoding.dyn_cast<DotOperandEncodingAttr>();
-      if (!operandEncoding.isa<SharedEncodingAttr>() &&
+      auto dotOpEnc = mlir::dyn_cast<DotOperandEncodingAttr>(operandEncoding);
+      if (!mlir::isa<SharedEncodingAttr>(operandEncoding) &&
           !(opIdx == 0 && dotOpEnc && dotOpEnc.getOpIdx() == 0 &&
-            dotOpEnc.getParent().isa<MmaEncodingAttr>())) {
+            mlir::isa<NvidiaMmaEncodingAttr>(dotOpEnc.getParent()))) {
         return emitOptionalError(
-            location, "unexpected operand layout for MmaEncodingAttr v3");
+            location, "unexpected operand layout for NvidiaMmaEncodingAttr v3");
       }
     } else if (auto dotOpEnc =
-                   operandEncoding.dyn_cast<DotOperandEncodingAttr>()) {
+                   mlir::dyn_cast<DotOperandEncodingAttr>(operandEncoding)) {
       if (opIdx != dotOpEnc.getOpIdx())
         return emitOptionalError(location, "Wrong opIdx");
       if (retEncoding != dotOpEnc.getParent())
@@ -1872,13 +2282,13 @@ struct TritonGPUInferLayoutInterface
   verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
                                    Attribute operandEncodingB) const override {
     auto aEncoding =
-        operandEncodingA.dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+        mlir::dyn_cast<triton::gpu::DotOperandEncodingAttr>(operandEncodingA);
     auto bEncoding =
-        operandEncodingB.dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+        mlir::dyn_cast<triton::gpu::DotOperandEncodingAttr>(operandEncodingB);
     if (!aEncoding && !bEncoding)
       return mlir::success();
     auto mmaAEncoding =
-        aEncoding.getParent().dyn_cast_or_null<MmaEncodingAttr>();
+        mlir::dyn_cast_or_null<NvidiaMmaEncodingAttr>(aEncoding.getParent());
     if (mmaAEncoding && mmaAEncoding.isHopper())
       return success();
     // Verify that the encodings are valid.
@@ -1888,231 +2298,657 @@ struct TritonGPUInferLayoutInterface
       return op->emitError("mismatching kWidth between A and B operands");
     return success();
   }
+
+  // Given a src shape + encoding and a dst shape, our goal is to compute a dst
+  // encoding that makes the reshape a "nop".  That is, if GPU thread [x,y,z]
+  // contains elements [a,b,c,d] before the reshape, it contains those same
+  // elements after the reshape, they're just "renamed".
+  //
+  // A dst encoding that satisfies this property does not exist for all inputs.
+  // Here are some positive and negative examples.
+  //
+  //   - NOT OK: 4x4 order=[0,1] -> 16.  Reshape merges elements so
+  //     dim 1 is the fastest-changing in the dst, but the src has the opposite
+  //     order.
+  //   - OK: 2x2x32 order=[1,0,2] -> 4x32.  We choose dst order [0,1].
+  //     What's important is that the 2x2 dimensions appear in major-to-minor
+  //     order.
+  //   - NOT OK: 32x32 sizePerThread=[2,2] -> 1024.  Thread 0 in the src
+  //     contains elements [(0,0), (0,1), (1,0), and (1,1)].  We cannot express
+  //     this with an encoding based on the dst shape.
+  //   - OK: 32x4 sizePerThread=[4,4] -> 128.  dst with sizePerThread=[16] will
+  //     contain the same elements as before.
+  //
+  // Users of this function require that it is symmetrical: if
+  // (srcShape,srcEnc,dstShape) => dstEnc, then (dstShape,dstEnc,srcShape) =>
+  // srcEnc.
+  LogicalResult
+  inferReshapeOpNoReorderEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
+                                  ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                                  std::optional<Location> loc) const override {
+    auto src = mlir::dyn_cast<BlockedEncodingAttr>(srcEnc);
+    if (!src) {
+      return emitOptionalError(
+          loc, "Non-reordering reshape only supports BlockedEncoding");
+    }
+
+    // Nop reshape; we can always infer an encoding.
+    if (srcShape == dstShape) {
+      dstEnc = srcEnc;
+      return success();
+    }
+
+    // default -> default encoding is always a nop.
+    auto context = srcEnc.getContext();
+    int32_t numWarps = product(src.getWarpsPerCTA());
+    int32_t threadsPerWarp = product(src.getThreadsPerWarp());
+    int32_t numCTAs = product(src.getCTALayout().getCTAsPerCGA());
+    if (srcEnc == getDefaultBlockedEncoding(context, srcShape, numWarps,
+                                            threadsPerWarp, numCTAs)) {
+      dstEnc = getDefaultBlockedEncoding(context, dstShape, numWarps,
+                                         threadsPerWarp, numCTAs);
+      return success();
+    }
+
+    // Feature flag to disable this routine while it's relatively new.
+    // TODO(jlebar): Remove this once we're confident in the code.
+    if (triton::tools::getBoolEnv(
+            "TRITON_DISABLE_RESHAPE_ENCODING_INFERENCE")) {
+      return failure();
+    }
+
+    // Cowardly refuse to handle encodings with multiple CTAs.  CTAsPerCGA
+    // should be like the other fields in blocked encoding, but I'm not sure how
+    // to handle CTASplitNum.
+    if (!all_of(src.getCTAsPerCGA(), [](int32_t x) { return x == 1; }) ||
+        !all_of(src.getCTASplitNum(), [](int32_t x) { return x == 1; })) {
+      return emitOptionalError(
+          loc, "Non-reordering reshape does not currently support multi-CTA "
+               "layouts other than the default layout.");
+    }
+
+    // Cowardly refuse to handle encodings where shape[dim] is not divisible by
+    // sizePerThread[dim], threadsPerWarp[dim], and warpsPerCTA[dim].  (We make
+    // an exception if the block is larger than the shape.)
+    auto checkDivisibility = [&](StringRef name, ArrayRef<unsigned> subblock) {
+      for (int dim = 0; dim < srcShape.size(); dim++) {
+        if (srcShape[dim] >= subblock[dim] &&
+            srcShape[dim] % subblock[dim] != 0) {
+          return emitOptionalError(loc,
+                                   "Can't do a non-reordering reshape because "
+                                   "the size of dimension ",
+                                   dim, " (", srcShape[dim], ")",
+                                   " is not divisible by ", name, "[", dim, "]",
+                                   " = ", subblock[dim]);
+        }
+      }
+      return success();
+    };
+    if (!succeeded(
+            checkDivisibility("sizePerThread", src.getSizePerThread())) ||
+        !succeeded(
+            checkDivisibility("threadsPerWarp", src.getThreadsPerWarp())) ||
+        !succeeded(checkDivisibility("warpsPerCTA", src.getWarpsPerCTA()))) {
+      return failure();
+    }
+
+    SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>> decomp =
+        getReshapeDecomposition(srcShape, dstShape);
+
+    // enc.order[i] == j means that dimension j is the enc.order[i]'th most
+    // minor. But what we usually want is the inverse: inverse(enc.order)[i] = j
+    // means that dimension i is the j'th most minor (larger means more major).
+    auto srcInvOrder = inversePermutation(src.getOrder());
+
+    // If src dims [a,b,c] are to be merged, then they must be consecutive in
+    // physical order, with `a` being the most major.
+    for (const auto &[srcDims, dstDims] : decomp) {
+      if (!isConsecutive(to_vector(reverse(gather(srcInvOrder, srcDims))))) {
+        return emitOptionalError(loc,
+                                 "Cannot do a non-reordering reshape given "
+                                 "this src encoding order.  Dimensions [",
+                                 join(srcDims),
+                                 "] must be physically consecutive.");
+      }
+    }
+
+    // If src dims [a,b,c] are to be merged, then `c` must fill up sizePerThread
+    // / threadsPerWarp / blocksPerCTA before `b` can have any non-1 values.
+    // Examples:
+    //
+    //  - NOT OK: shape=[4,4,4], sizePerThread=[1,2,2].
+    //    The total sizePerThread for dim 2 is 2, which is less than dim 2's
+    //    size of 4.  Therefore dim 1 cannot have non-1 sizePerThread.
+    //
+    //  - OK: shape=[4,4,4], sizePerThread=[1,2,4].
+    //    Dim 2's sizePerThread covers its whole size, so dim 1 is allowed to
+    //    have non-1 sizePerThread.
+    //
+    //  - NOT OK: shape=[4,4,4], sizePerThread=[2,1,4].
+    //    Dim 1's sizePerThread does not cover its whole size, so dim 0 is not
+    //    allowed to have non-1 sizePerThread.
+    //
+    //  - NOT OK: shape=[4,4,4], sizePerThread=[1,1,2],
+    //            threadsPerWarp=[1,2,1].
+    //    Dim 2 has 2 elems per thread and 1 thread per warp.  2*1 is less than
+    //    dim 2's size.  Therefore dim 1 must have threadsPerWarp=1.
+    //
+    // In addition, the encoding's block can be larger than the shape, but only
+    // in the most-major dimension of each decomposed chunk, and only after
+    // we've "used up" the more minor dims.  Examples:
+    //
+    //  - OK: shape=[4,4,4], sizePerThread=[1,2,4], threadsPerWarp=[16,2,1],
+    //        warpsPerCTA=[4,1,1].
+    //    The whole size of dims 0 and 1 are covered by sizePerThread *
+    //    threadsPerWarp.  Therefore dim 2 is allowed to have threadsPerWarp and
+    //    warpsPerCTA larger than its size.
+    for (const auto &[srcDims, dstDims] : decomp) {
+      auto shapeRemaining = gather(srcShape, srcDims);
+      auto checkSubblock = [&, srcDims = srcDims](ArrayRef<unsigned> subblock) {
+        // Iterate minor-to-major (i==0 is most major).
+        for (int i = srcDims.size() - 1; i >= 0; i--) {
+          int dim = srcDims[i];
+          if (subblock[dim] == 1) {
+            continue;
+          }
+
+          // Check that more-minor dims all have 1 in shapeRemaining.
+          for (int j = i + 1; j < srcDims.size(); j++) {
+            if (shapeRemaining[j] != 1) {
+              return emitOptionalError(
+                  loc,
+                  "Invalid src encoding for non-reordering reshape.  Must use "
+                  "up sizePerThread / threadsPerWarp / warpsPerCTA for "
+                  "more-minor dimensions before more major-dims can use them.");
+            }
+          }
+
+          if (shapeRemaining[i] >= subblock[dim]) {
+            assert(shapeRemaining[i] % subblock[dim] == 0); // checked earlier
+            shapeRemaining[i] /= subblock[dim];
+          } else {
+            shapeRemaining[i] = 0;
+          }
+
+          // Is the block larger than the shape in this dimension?  This is OK
+          // only if we're the most-major dimension of the chunk and in all
+          // future chunks, only this most-major dim has a non-1 size.
+          if (shapeRemaining[i] == 0 && i != 0) {
+            return emitOptionalError(
+                loc,
+                "Invalid src encoding for non-reordering reshape.  Block "
+                "size in dimension ",
+                dim,
+                " is larger than the shape that dimension, but this is only "
+                "allowed for the most-major dimension of a reshape chunk");
+          }
+        }
+        return success();
+      };
+      if (!succeeded(checkSubblock(src.getSizePerThread())) ||
+          !succeeded(checkSubblock(src.getThreadsPerWarp())) ||
+          !succeeded(checkSubblock(src.getWarpsPerCTA()))) {
+        return failure();
+      }
+    }
+
+    // Given e.g. src.getSizePerThread(), computeSubblockSize computes e.g.
+    // dst.getSizePerThread().  This should be called for each of sizePerThread,
+    // threadsPerWarp, and warpsPerCTA, in that order.
+    SmallVector<int64_t> dstShapeRemaining(dstShape);
+    auto computeSubblockSize = [&](ArrayRef<unsigned> srcSubblock,
+                                   SmallVector<unsigned> &dstSubblock,
+                                   StringRef fieldName) -> LogicalResult {
+      // The dst subblock is "filled up" greedily starting with the most minor
+      // dim.  When we're done, we are left with a smaller shape, of size
+      // dstShape / dstSubblock, which we store in dstShapeRemaining and use for
+      // the next call to computeSubblockSize.
+      dstSubblock.resize(dstShape.size());
+      for (const auto &[srcDims, dstDims] : decomp) {
+        int64_t subblockRemaining = product(gather(srcSubblock, srcDims));
+        for (int i = dstDims.size() - 1; i >= 0; i--) {
+          auto &val = dstSubblock[dstDims[i]];
+          auto &shapeRemaining = dstShapeRemaining[dstDims[i]];
+          val = std::min(subblockRemaining, shapeRemaining);
+
+          assert(shapeRemaining % val == 0); // Checked earlier.
+          subblockRemaining /= val;
+          shapeRemaining /= val;
+        }
+
+        // If there are any elems remaining in the subblock, it must be because
+        // the block is larger than the shape.  This excess goes into the
+        // most-major dim of the subblock.
+        dstSubblock[dstDims[0]] *= subblockRemaining;
+      }
+      return success();
+    };
+
+    SmallVector<unsigned> dstSizePerThread;
+    SmallVector<unsigned> dstThreadsPerWarp;
+    SmallVector<unsigned> dstWarpsPerCTA;
+    if (!succeeded(computeSubblockSize(src.getSizePerThread(), dstSizePerThread,
+                                       "sizePerThread")) ||
+        !succeeded(computeSubblockSize(src.getThreadsPerWarp(),
+                                       dstThreadsPerWarp, "threadsPerWarp")) ||
+        !succeeded(computeSubblockSize(src.getWarpsPerCTA(), dstWarpsPerCTA,
+                                       "warpsPerCTA"))) {
+      return failure();
+    }
+
+    // Since we know that each set of srcDims is consecutive, we can
+    // meaningfully sort decomp by the physical order of the src dimensions,
+    // major-to-minor.  This will also be the order of the dst dimensions.
+    llvm::sort(decomp, [&](const auto &a, const auto &b) {
+      const auto &[srcDimsA, dstDimsA] = a;
+      const auto &[srcDimsB, dstDimsB] = b;
+      return srcInvOrder[srcDimsA.front()] < srcInvOrder[srcDimsB.front()];
+    });
+
+    // Compute the dst order.  Make the dimensions appear in the same order as
+    // their corresponding src dimensions.
+    SmallVector<unsigned> dstInvOrder(dstShape.size());
+    int i = 0;
+    for (const auto &[srcDims, dstDims] : decomp) {
+      for (auto dim : reverse(dstDims)) {
+        dstInvOrder[dim] = i++;
+      }
+    }
+    auto dstOrder = inversePermutation(dstInvOrder);
+
+    // CTALayout can be all 1's because we bailed on multi-CTA layouts above.
+    auto CTALayout = CTALayoutAttr::get(
+        src.getContext(),
+        /*CTAsPerCGA=*/SmallVector<unsigned>(dstShape.size(), 1),
+        /*CTASplitNum=*/SmallVector<unsigned>(dstShape.size(), 1),
+        /*CTAOrder=*/llvm::to_vector(llvm::seq<unsigned>(dstShape.size())));
+
+    dstEnc = BlockedEncodingAttr::get(src.getContext(), dstSizePerThread,
+                                      dstThreadsPerWarp, dstWarpsPerCTA,
+                                      dstOrder, CTALayout);
+
+    return success();
+  }
+
+  LogicalResult
+  inferJoinOpEncoding(Attribute srcEnc, Attribute &dstEnc,
+                      std::optional<Location> loc) const override {
+    auto enc = mlir::dyn_cast<BlockedEncodingAttr>(srcEnc);
+    if (!enc) {
+      return emitOptionalError(loc,
+                               "JoinOp can only operate on BlockedEncoding");
+    }
+
+    // JoinOp takes two tensors of shape AxBxC and generates a tensor of shape
+    // AxBxCx2.  The encoding is the same as the input, but with 2 elems per
+    // thread in the new dimension.  The new dimension is most-minor.
+    auto append = [](ArrayRef<unsigned> vals, int val) {
+      SmallVector<unsigned> ret(vals);
+      ret.push_back(val);
+      return ret;
+    };
+    auto appendMinorDim = [](ArrayRef<unsigned> order) {
+      SmallVector<unsigned> ret(order);
+      ret.insert(ret.begin(), ret.size());
+      return ret;
+    };
+    dstEnc = BlockedEncodingAttr::get(
+        enc.getContext(),                    //
+        append(enc.getSizePerThread(), 2),   //
+        append(enc.getThreadsPerWarp(), 1),  //
+        append(enc.getWarpsPerCTA(), 1),     //
+        appendMinorDim(enc.getOrder()),      //
+        CTALayoutAttr::get(enc.getContext(), //
+                           append(enc.getCTAsPerCGA(), 1),
+                           append(enc.getCTASplitNum(), 1),
+                           appendMinorDim(enc.getCTAOrder())));
+    return success();
+  }
+
+  LogicalResult
+  inferSplitOpEncoding(Attribute srcEnc, Attribute &dstEnc,
+                       std::optional<Location> loc) const override {
+    auto enc = mlir::dyn_cast<BlockedEncodingAttr>(srcEnc);
+    if (!enc) {
+      return emitOptionalError(loc,
+                               "SplitOp can only operate on BlockedEncoding");
+    }
+
+    // SplitOp takes a tensor of shape AxBxCx2 and generates two tensors of
+    // shape AxBxC.  The input must have 2 elements per thread in the last
+    // dimension, which must be most-minor.  The result encoding is the same as
+    // the input, but with the last dimension removed.
+    if (enc.getSizePerThread().back() != 2) {
+      return emitOptionalError(loc,
+                               "SplitOp requires 2 elements per thread in the "
+                               "last dimension of the input");
+    }
+    if (enc.getThreadsPerWarp().back() != 1 ||
+        enc.getWarpsPerCTA().back() != 1 || enc.getCTAsPerCGA().back() != 1) {
+      return emitOptionalError(
+          loc, "SplitOp requires threadsPerWarp, warpsPerCTA, "
+               "and CTAsPerCGA = 1 for the last dimension of the input");
+    }
+    if (enc.getOrder().front() != enc.getOrder().size() - 1) {
+      return emitOptionalError(
+          loc, "SplitOp requires the last dimension to be most-minor in order");
+    }
+    if (enc.getCTALayout().getCTAsPerCGA().back() != 1) {
+      return emitOptionalError(
+          loc,
+          "SplitOp requires the last dimension to be most-minor in CTAOrder");
+    }
+
+    dstEnc = BlockedEncodingAttr::get(
+        enc.getContext(), //
+        ArrayRef(enc.getSizePerThread()).drop_back(1),
+        ArrayRef(enc.getThreadsPerWarp()).drop_back(1),
+        ArrayRef(enc.getWarpsPerCTA()).drop_back(1),
+        ArrayRef(enc.getOrder()).drop_front(1),
+        CTALayoutAttr::get(enc.getContext(), //
+                           ArrayRef(enc.getCTAsPerCGA()).drop_back(1),
+                           ArrayRef(enc.getCTASplitNum()).drop_back(1),
+                           ArrayRef(enc.getCTAOrder()).drop_front(1)));
+    return success();
+  }
 };
 
 //===----------------------------------------------------------------------===//
 // Canonicalizer
 //===----------------------------------------------------------------------===//
 
-struct CanonicalizeConvertFromView
-    : public mlir::OpRewritePattern<triton::ViewOp> {
-
-  CanonicalizeConvertFromView(MLIRContext *context)
-      : OpRewritePattern<triton::ViewOp>(context, 1) {}
+// reshape(cvt) -> reshape
+struct CanonicalizeConvertFromReshape
+    : public mlir::OpRewritePattern<triton::ReshapeOp> {
+  using OpRewritePattern::OpRewritePattern;
 
   mlir::LogicalResult
-  matchAndRewrite(triton::ViewOp op, PatternRewriter &rewriter) const override {
-    Operation *arg = op->getOperand(0).getDefiningOp();
-    if (!arg)
-      return mlir::failure();
-    auto convert = dyn_cast<ConvertLayoutOp>(arg);
+  matchAndRewrite(triton::ReshapeOp op,
+                  PatternRewriter &rewriter) const override {
+    auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert)
       return failure();
-    if (isExpensiveView(convert.getOperand().getType(), op.getType()))
+    if (isExpensiveView(convert.getSrc().getType(), op.getType()))
       return failure();
-    // view(convert) -> view
-    rewriter.replaceOpWithNewOp<triton::ViewOp>(op, op->getResult(0).getType(),
-                                                convert.getOperand());
+    if (!op.getAllowReorder() || op.getEfficientLayout().has_value())
+      return failure();
+
+    rewriter.replaceOpWithNewOp<triton::ReshapeOp>(
+        op, op.getType(), convert.getSrc(), op.getAllowReorder());
+    return mlir::success();
+  }
+};
+
+// histogram(cvt) -> histogram
+struct CanonicalizeConvertFromHistogram
+    : public mlir::OpRewritePattern<triton::HistogramOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::HistogramOp op,
+                  PatternRewriter &rewriter) const override {
+    auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::HistogramOp>(
+        op, op->getResult(0).getType(), convert.getSrc());
+    return mlir::success();
+  }
+};
+
+// alloc(cvt) -> alloc
+struct CanonicalizeConvertFromAlloc
+    : public mlir::OpRewritePattern<triton::gpu::LocalAllocOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::gpu::LocalAllocOp op,
+                  PatternRewriter &rewriter) const override {
+    if (!op.getSrc())
+      return failure();
+    auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::gpu::LocalAllocOp>(
+        op, op->getResult(0).getType(), convert.getSrc());
+    return mlir::success();
+  }
+};
+
+// local_store(cvt) -> local_store
+struct CanonicalizeConvertFromLocalStore
+    : public mlir::OpRewritePattern<triton::gpu::LocalStoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::gpu::LocalStoreOp op,
+                  PatternRewriter &rewriter) const override {
+    auto convert = op.getSrc().getDefiningOp<ConvertLayoutOp>();
+    if (!convert)
+      return failure();
+    rewriter.replaceOpWithNewOp<triton::gpu::LocalStoreOp>(op, convert.getSrc(),
+                                                           op.getDst());
     return mlir::success();
   }
 };
 
 struct CanonicalizeConvertFromConvert
-    : public mlir::OpRewritePattern<ConvertLayoutOp> {
-
-  CanonicalizeConvertFromConvert(mlir::MLIRContext *context)
-      : OpRewritePattern<ConvertLayoutOp>(context, 1) {}
+    : public OpRewritePattern<ConvertLayoutOp> {
+  using OpRewritePattern::OpRewritePattern;
 
   mlir::LogicalResult
   matchAndRewrite(ConvertLayoutOp op,
-                  mlir::PatternRewriter &rewriter) const override {
-    // we don't handle conversions to DotOperandEncodingAttr
-    // this is a heuristics to accommodate fused attention
-    auto srcType = op.getOperand().getType().cast<RankedTensorType>();
-    auto dstType = op.getType().cast<RankedTensorType>();
-    if (dstType.getEncoding().isa<triton::gpu::DotOperandEncodingAttr>() &&
-        (srcType.getEncoding().isa<triton::gpu::MmaEncodingAttr>() ||
-        srcType.getEncoding().isa<triton::gpu::MfmaEncodingAttr>()))
-      return mlir::failure();
-    // for hopper MMAv3
-    if (!op.use_empty()) {
-      bool hasDotUser = false;
-      for (Operation *dot : op.getResult().getUsers())
-        if (isa<triton::DotOp>(dot))
-          hasDotUser = true;
-
-      if (hasDotUser) {
-        if (dstType.getEncoding().isa<triton::gpu::SharedEncodingAttr>() &&
-            srcType.getEncoding().isa<triton::gpu::MmaEncodingAttr>())
-          return mlir::failure();
-      }
-    }
-
-    // convert to the same layout -- we can delete
+                  PatternRewriter &rewriter) const override {
+    // Convert to the same layout is redundant.
     if (op->getResultTypes() == op->getOperandTypes()) {
       rewriter.replaceOp(op, op->getOperands());
-      return mlir::success();
+      return success();
     }
-    Operation *arg = op->getOperand(0).getDefiningOp();
-    // block argument
+
+    // We don't handle conversions to DotOperandEncodingAttr.  This is a
+    // heuristic to accommodate fused attention.
+    auto srcType = op.getSrc().getType();
+    auto dstType = op.getType();
+    if (mlir::isa<DotOperandEncodingAttr>(dstType.getEncoding()) &&
+        mlir::isa<NvidiaMmaEncodingAttr>(srcType.getEncoding()))
+      return failure();
+
+    // for hopper MMAv3
+    if (mlir::isa<SharedEncodingAttr>(dstType.getEncoding()) &&
+        mlir::isa<NvidiaMmaEncodingAttr>(srcType.getEncoding()) &&
+        llvm::any_of(op.getResult().getUsers(), [](Operation *dot) {
+          return dot->hasTrait<OpTrait::DotLike>();
+        })) {
+      return failure();
+    }
+
+    Operation *arg = op.getSrc().getDefiningOp();
     if (!arg)
-      return mlir::failure();
-    // cvt(view) -> view
-    if (auto view = dyn_cast<triton::ViewOp>(arg)) {
-      if (isExpensiveView(view.getOperand().getType(), op.getType()))
+      return failure();
+
+    // cvt(reshape) -> reshape
+    if (auto reshape = dyn_cast<ReshapeOp>(arg)) {
+      if (!reshape.getAllowReorder() ||
+          reshape.getEfficientLayout().has_value() ||
+          isExpensiveView(reshape.getSrc().getType(), op.getType()))
         return failure();
-      rewriter.replaceOpWithNewOp<triton::ViewOp>(
-          op, op->getResult(0).getType(), view.getResult());
-      return mlir::success();
+
+      // In TritonGPUToLLVM phase, ViewOp is converted to unpacking and packing
+      // operations, which requires the element type to match between unpacking
+      // and packing. However, part of values with dot operand encoding will be
+      // packed/unpacked as i32 elements instead of the underlying element type.
+      // To avoid errors, skip this folding when either the operand or result
+      // of view has a dot operand encoding.
+      if (hasDotOperandEncoding(op->getOperand(0)) ||
+          hasDotOperandEncoding(op->getResult(0)))
+        return failure();
+
+      rewriter.replaceOpWithNewOp<ReshapeOp>(op, op->getResult(0).getType(),
+                                             reshape.getResult(),
+                                             reshape.getAllowReorder());
+      return success();
     }
+
+    // cvt(histogram) -> histogram
+    if (auto histogram = dyn_cast<HistogramOp>(arg)) {
+      // For histogram ops the input and output layouts are independent, so we
+      // can always fold convert into the histogram op.
+      rewriter.replaceOpWithNewOp<HistogramOp>(op, op->getResult(0).getType(),
+                                               histogram.getSrc());
+      return success();
+    }
+
+    // cvt(local_load) -> local_load.
+    if (auto sharedLoad = dyn_cast<LocalLoadOp>(arg)) {
+      // Shared_load can load to any layout so we can always fold convert into
+      // it.
+      rewriter.replaceOpWithNewOp<LocalLoadOp>(op, op->getResult(0).getType(),
+                                               sharedLoad.getSrc());
+      return success();
+    }
+
     // cvt(cat) -> cat
-    if (auto cat = dyn_cast<triton::CatOp>(arg)) {
-      auto encoding =
-          op->getResult(0).getType().cast<RankedTensorType>().getEncoding();
-      if (isExpensiveCat(cat, encoding))
-        return mlir::failure();
-      rewriter.replaceOpWithNewOp<triton::CatOp>(op, op->getResult(0).getType(),
-                                                 cat.getOperands());
-      return mlir::success();
-    }
-    // cvt(alloc_tensor(x), type2) -> alloc_tensor(x, type2)
-    auto alloc_tensor = dyn_cast<triton::gpu::AllocTensorOp>(arg);
-    if (alloc_tensor) {
-      if (!triton::gpu::isSharedEncoding(op->getResult(0))) {
-        return mlir::failure();
-      }
-      rewriter.replaceOpWithNewOp<triton::gpu::AllocTensorOp>(
-          op, op->getResult(0).getType());
-      return mlir::success();
-    }
-    // cvt(insert_slice(x), type2) -> insert_slice(cvt(x, type2))
-    auto insert_slice = dyn_cast<triton::gpu::InsertSliceAsyncOp>(arg);
-    if (insert_slice) {
-      if (!triton::gpu::isSharedEncoding(op->getResult(0))) {
-        return mlir::failure();
-      }
-      auto newType = op->getResult(0).getType().cast<RankedTensorType>();
-      // Ensure that the new insert_slice op is placed in the same place as
-      // the old insert_slice op. Otherwise, the new insert_slice op may be
-      // placed after the async_wait op, which is not allowed.
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(insert_slice);
-      auto newArg = rewriter.create<triton::gpu::ConvertLayoutOp>(
-          op->getLoc(), newType, insert_slice.getDst());
-      rewriter.replaceOpWithNewOp<triton::gpu::InsertSliceAsyncOp>(
-          op, newType, insert_slice.getSrc(), newArg.getResult(),
-          insert_slice.getIndex(), insert_slice.getMask(),
-          insert_slice.getOther(), insert_slice.getCache(),
-          insert_slice.getEvict(), insert_slice.getIsVolatile(),
-          insert_slice.getAxis());
-      return mlir::success();
-    }
-    // cvt(extract_slice(x), type2) -> extract_slice(cvt(x, type2))
-    auto extract_slice = dyn_cast<triton::gpu::ExtractSliceOp>(arg);
-    if (extract_slice) {
-      if (!triton::gpu::isSharedEncoding(op->getResult(0))) {
-        return mlir::failure();
-      }
-      auto origType =
-          extract_slice.getSource().getType().cast<RankedTensorType>();
-      auto newType = RankedTensorType::get(
-          origType.getShape(), origType.getElementType(),
-          op->getResult(0).getType().cast<RankedTensorType>().getEncoding());
-      auto origResType = op->getResult(0).getType().cast<RankedTensorType>();
-      auto resType = RankedTensorType::get(
-          origResType.getShape(), origResType.getElementType(),
-          extract_slice.getType().cast<RankedTensorType>().getEncoding());
-      // Ensure that the new extract_slice op is placed in the same place as
-      // the old extract_slice op. Otherwise, the new extract_slice op may be
-      // placed after the async_wait op, which is not allowed.
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(extract_slice);
-      auto newArg = rewriter.create<triton::gpu::ConvertLayoutOp>(
-          op->getLoc(), newType, extract_slice.getSource());
-      rewriter.replaceOpWithNewOp<triton::gpu::ExtractSliceOp>(
-          op, resType, newArg.getResult(), extract_slice.getOffsets(),
-          extract_slice.getSizes(), extract_slice.getStrides(),
-          extract_slice.getStaticOffsets(), extract_slice.getStaticSizes(),
-          extract_slice.getStaticStrides());
-      return mlir::success();
+    if (auto cat = dyn_cast<CatOp>(arg)) {
+      if (isExpensiveCat(cat, op.getType().getEncoding()))
+        return failure();
+
+      rewriter.replaceOpWithNewOp<CatOp>(op, op->getResult(0).getType(),
+                                         cat.getOperands());
+      return success();
     }
 
     // cvt(cvt(x, type1), type2) -> cvt(x, type2)
-    if (llvm::isa<triton::gpu::ConvertLayoutOp>(arg)) {
-      if (arg->getOperand(0).getDefiningOp() &&
-          !triton::gpu::isSharedEncoding(arg->getOperand(0)) &&
-          triton::gpu::isSharedEncoding(op.getOperand()) &&
-          !triton::gpu::isSharedEncoding(op.getResult())) {
-        return mlir::failure();
-      }
-      if (triton::gpu::isSharedEncoding(op.getOperand()) &&
-          triton::gpu::isSharedEncoding(op.getResult())) {
-        return mlir::failure();
-      }
-      auto srcType = op.getOperand().getType().cast<RankedTensorType>();
-      auto srcShared =
-          srcType.getEncoding().dyn_cast<triton::gpu::SharedEncodingAttr>();
-      if (srcShared && srcShared.getVec() > 1)
-        return mlir::failure();
+    if (auto cvt = dyn_cast<ConvertLayoutOp>(arg)) {
+      auto srcType = op.getSrc().getType();
       rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
-          op, op->getResultTypes().front(), arg->getOperand(0));
-      return mlir::success();
+          op, op->getResultTypes().front(), cvt.getSrc());
+      return success();
     }
+
     // cvt(type1, splat(type2, x)) -> splat(type1, x)
-    if (auto splat = llvm::dyn_cast<triton::SplatOp>(arg)) {
+    if (auto splat = dyn_cast<triton::SplatOp>(arg)) {
       rewriter.replaceOpWithNewOp<triton::SplatOp>(op, op->getResultTypes(),
                                                    splat.getSrc());
-      return mlir::success();
+      return success();
     }
+
     // cvt(type1, make_range(type2, x)) -> make_range(type1, x)
-    if (auto range = llvm::dyn_cast<triton::MakeRangeOp>(arg)) {
-      rewriter.replaceOpWithNewOp<triton::MakeRangeOp>(
+    if (auto range = dyn_cast<MakeRangeOp>(arg)) {
+      rewriter.replaceOpWithNewOp<MakeRangeOp>(
           op, op->getResultTypes(), range.getStart(), range.getEnd());
-      return mlir::success();
+      return success();
     }
+
     // cvt(type, constant) -> constant
     if (auto cst = llvm::dyn_cast<arith::ConstantOp>(arg))
-      if (auto ret = cst.getValue().dyn_cast<SplatElementsAttr>()) {
-        auto ty = op->getResultTypes().front().cast<ShapedType>();
+      if (auto ret = dyn_cast<SplatElementsAttr>(cst.getValue())) {
+        auto ty = cast<ShapedType>(op->getResultTypes().front());
         auto newRet =
             SplatElementsAttr::get(ty, ret.getSplatValue<Attribute>());
         rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, newRet);
-        return mlir::success();
+        return success();
       }
-    return mlir::failure();
+    return failure();
   }
 };
 
 void ConvertLayoutOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
                                                   MLIRContext *context) {
   patterns.add<CanonicalizeConvertFromConvert>(context);
-  patterns.add<CanonicalizeConvertFromView>(context);
+  patterns.add<CanonicalizeConvertFromReshape>(context);
+  patterns.add<CanonicalizeConvertFromHistogram>(context);
+  patterns.add<CanonicalizeConvertFromAlloc>(context);
+  patterns.add<CanonicalizeConvertFromLocalStore>(context);
 }
 
-//===----------------------------------------------------------------------===//
-
-/// Build an ExtractSliceOp with mixed static and dynamic entries and custom
-/// result type. If the type passed is nullptr, it is inferred.
-void ExtractSliceOp::build(OpBuilder &b, OperationState &result,
-                           RankedTensorType resultType, Value source,
-                           ArrayRef<OpFoldResult> offsets,
-                           ArrayRef<OpFoldResult> sizes,
-                           ArrayRef<OpFoldResult> strides,
-                           ArrayRef<NamedAttribute> attrs) {
-  SmallVector<int64_t> staticOffsets, staticSizes, staticStrides;
-  SmallVector<Value> dynamicOffsets, dynamicSizes, dynamicStrides;
-  dispatchIndexOpFoldResults(offsets, dynamicOffsets, staticOffsets);
-  dispatchIndexOpFoldResults(sizes, dynamicSizes, staticSizes);
-  dispatchIndexOpFoldResults(strides, dynamicStrides, staticStrides);
-  auto sourceRankedTensorType = source.getType().cast<RankedTensorType>();
-  build(b, result, resultType, source, dynamicOffsets, dynamicSizes,
-        dynamicStrides, b.getDenseI64ArrayAttr(staticOffsets),
-        b.getDenseI64ArrayAttr(staticSizes),
-        b.getDenseI64ArrayAttr(staticStrides));
-  result.addAttributes(attrs);
+// LocalAllocOp
+void LocalAllocOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  Operation *op = getOperation();
+  // If allocation is immutable, mark it as no side effect allow things like
+  // CSE, DCE to work in early compiler passes.
+  // After the memory offset is computed, we attach the true side effect to the
+  // op.
+  if (!getType().getMutableMemory() && !op->hasAttr("allocation.offset"))
+    return;
+  effects.emplace_back(MemoryEffects::Allocate::get(),
+                       mlir::triton::gpu::SharedMemory::get());
+  if (getSrc())
+    effects.emplace_back(MemoryEffects::Write::get(), getResult(),
+                         mlir::triton::gpu::SharedMemory::get());
 }
 
-//===----------------------------------------------------------------------===//
+// LocalLoadOp
+void LocalLoadOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), getSrc(),
+                       mlir::triton::gpu::SharedMemory::get());
+}
+
+// LocalStoreOp
+void LocalStoreOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get(), getDst(),
+                       mlir::triton::gpu::SharedMemory::get());
+}
+
+// AsyncCopyGlobalToLocalOp
+void AsyncCopyGlobalToLocalOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), getSrc(),
+                       mlir::triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), getResult(),
+                       mlir::triton::gpu::SharedMemory::get());
+}
+
+LogicalResult MemDescSubviewOp::verify() {
+  auto srcTy = getSrc().getType();
+  auto dstTy = getType();
+
+  if (srcTy.getElementType() != dstTy.getElementType()) {
+    return emitError("result element type must match desc element type");
+  }
+  if (getOffsets().size() != srcTy.getRank()) {
+    return emitError("offsets must have the same rank as input");
+  }
+  if (srcTy.getRank() < dstTy.getRank()) {
+    return emitError("result rank must be less than or equal to input rank");
+  }
+  auto rankDiff = srcTy.getRank() - dstTy.getRank();
+  for (int i = 0; i < dstTy.getRank(); i++) {
+    if (dstTy.getDimSize(i) > srcTy.getDimSize(i + rankDiff)) {
+      return emitError(
+                 "result shape cannot be larger than input shape at dimension ")
+             << i;
+    }
+  }
+
+  auto srcEnc = srcTy.getEncoding();
+  auto dstEnc = dstTy.getEncoding();
+  if (!!srcEnc != !!dstEnc) {
+    return emitError("src and result must both have or not have an encoding");
+  }
+
+  if (!isa<SharedEncodingAttr>(srcEnc)) {
+    return emitError("src encoding must be SharedEncodingAttr");
+  }
+  if (!isa<SharedEncodingAttr>(dstEnc)) {
+    return emitError("result encoding must be SharedEncodingAttr");
+  }
+
+  // TODO(jlebar): Currently we generate illegal encodings, so we can't add a
+  // verifier for them.  In particular, we use the same encoding for the src and
+  // dst of a subview op, when the subview removes a dimension.  That generates
+  // an illegal shared encoding (because the size of `order` doesn't match the
+  // rank of the tensor), but it's not checked anywhere, and we believe the
+  // resulting code ultimately works.
+
+  return success();
+}
 
 void TritonGPUDialect::initialize() {
   registerTypes();

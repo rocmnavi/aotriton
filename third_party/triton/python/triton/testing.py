@@ -4,9 +4,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from typing import Any, Dict, List
-
 from . import language as tl
-from ._C.libtriton.triton import runtime
 
 
 def nvsmi(attrs):
@@ -18,8 +16,7 @@ def nvsmi(attrs):
     return ret
 
 
-def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
-    import torch
+def do_bench_cudagraph(fn, rep=20, grad_to_none=None, return_mode="mean"):
     """
     Benchmark the runtime of the provided function.
 
@@ -29,7 +26,12 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
     :type rep: int
     :param grad_to_none: Reset the gradient of the provided tensor to None
     :type grad_to_none: torch.tensor, optional
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", or "median". Default is "mean".
+    :type return_mode: str
     """
+    import torch
+    assert return_mode in ["min", "max", "mean", "median"]
+
     if torch.cuda.current_stream() == torch.cuda.default_stream():
         raise RuntimeError("Cannot capture graph in default stream. Please use side stream in benchmark code.")
     # warmup
@@ -58,7 +60,7 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
     # host overhead
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for i in range(n_repeat):
+        for _ in range(n_repeat):
             if grad_to_none is not None:
                 for x in grad_to_none:
                     x.grad = None
@@ -67,7 +69,7 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
     # measure time and return
     ret = []
     n_retries = 10
-    for i in range(n_retries):
+    for _ in range(n_retries):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
@@ -75,12 +77,11 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None):
         end_event.record()
         torch.cuda.synchronize()
         ret += [start_event.elapsed_time(end_event) / n_repeat]
-    return torch.mean(torch.tensor(ret)).item()
+    times = torch.tensor(ret)
+    return getattr(torch, return_mode)(times).item()
 
 
 def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mode="mean"):
-    assert return_mode in ["min", "max", "mean", "median"]
-    import torch
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -94,21 +95,26 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
     :param grad_to_none: Reset the gradient of the provided tensor to None
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
-    :type quantiles: list[float]
-    :param fast_flush: Use faster kernel to flush L2 between measurements
-    :type fast_flush: bool
+    :type quantiles: list[float], optional
+    :param fast_flush: Use faster kernel to flush L2 cache between measurements
+    :type fast_flush: bool, default is True
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", or "median". Default is "mean".
+    :type return_mode: str
     """
+    assert return_mode in ["min", "max", "mean", "median"]
+    import torch
 
     fn()
     torch.cuda.synchronize()
 
     # We maintain a buffer of 256 MB that we clear
-    # before each kernel call to make sure that the L2
+    # before each kernel call to make sure that the L2 cache
     # doesn't contain any input data before the run
+    cache_size = 256 * 1024 * 1024
     if fast_flush:
-        cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
+        cache = torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')
     else:
-        cache = torch.empty(int(256e6), dtype=torch.int8, device='cuda')
+        cache = torch.empty(int(cache_size), dtype=torch.int8, device='cuda')
 
     # Estimate the runtime of the function
     start_event = torch.cuda.Event(enable_timing=True)
@@ -155,6 +161,20 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flu
 
 
 def assert_close(x, y, atol=None, rtol=None, err_msg=''):
+    """
+    Asserts that two inputs are close within a certain tolerance.
+
+    :param x: The first input.
+    :type x: scala, list, numpy.ndarray, or torch.Tensor
+    :param y: The second input.
+    :type y: scala, list, numpy.ndarray, or torch.Tensor
+    :param atol: The absolute tolerance. Default value is 1e-2.
+    :type atol: float, optional
+    :param rtol: The relative tolerance. Default value is 0.
+    :type rtol: float, optional
+    :param err_msg: The error message to use if the assertion fails.
+    :type err_msg: str
+    """
     import numpy as np
     import torch
 
@@ -209,7 +229,6 @@ class Benchmark:
         ylabel: str = '',
         x_log: bool = False,
         y_log: bool = False,
-        color=None,
         styles=None,
     ):
         """
@@ -241,6 +260,8 @@ class Benchmark:
         :type x_log: bool, optional
         :param y_log: Whether the y axis should be log scale.
         :type y_log: bool, optional
+        :param styles: A list of tuples, where each tuple contains two elements: a color and a linestyle.
+        :type styles: list[tuple[str, str]]
         """
         self.x_names = x_names
         self.x_vals = x_vals
@@ -263,7 +284,8 @@ class Mark:
         self.fn = fn
         self.benchmarks = benchmarks
 
-    def _run(self, bench: Benchmark, save_path: str, show_plots: bool, print_data: bool, diff_col=False, **kwrags):
+    def _run(self, bench: Benchmark, save_path: str, show_plots: bool, print_data: bool, diff_col=False,
+             save_precision=6, **kwrags):
         import os
 
         import matplotlib.pyplot as plt
@@ -325,9 +347,10 @@ class Mark:
 
         if print_data:
             print(bench.plot_name + ':')
-            print(df)
+            print(df.to_string())
         if save_path:
-            df.to_csv(os.path.join(save_path, f"{bench.plot_name}.csv"), float_format='%.1f', index=False)
+            df.to_csv(os.path.join(save_path, f"{bench.plot_name}.csv"), float_format=f"%.{save_precision}f",
+                      index=False)
         return df
 
     def run(self, show_plots=False, print_data=False, save_path='', return_df=False, **kwargs):
@@ -335,6 +358,8 @@ class Mark:
         benchmarks = [self.benchmarks] if has_single_bench else self.benchmarks
         result_dfs = []
         if save_path:
+            # Create directory if it doesn't exist
+            os.makedirs(save_path, exist_ok=True)
             html = open(os.path.join(save_path, "results.html"), "w")
             html.write("<html><body>\n")
         for bench in benchmarks:
@@ -343,6 +368,7 @@ class Mark:
                 html.write(f"<image src=\"{bench.plot_name}.png\"/>\n")
         if save_path:
             html.write("</body></html>\n")
+            html.close()
         if return_df:
             if has_single_bench:
                 return result_dfs[0]
@@ -362,31 +388,27 @@ def perf_report(benchmarks):
     return wrapper
 
 
-def get_dram_gbps(backend=None, device=None):
+def get_dram_gbps(device=None):
     ''' return DRAM bandwidth in GB/s '''
     import torch
 
     from .runtime import driver
-    if not backend:
-        backend = runtime.backend.CUDA
     if not device:
         device = torch.cuda.current_device()
-    mem_clock_khz = driver.utils.get_device_properties(device)["mem_clock_rate"]  # in kHz
-    bus_width = driver.utils.get_device_properties(device)["mem_bus_width"]
+    mem_clock_khz = driver.active.utils.get_device_properties(device)["mem_clock_rate"]  # in kHz
+    bus_width = driver.active.utils.get_device_properties(device)["mem_bus_width"]
     bw_gbps = mem_clock_khz * bus_width * 2 / 1e6 / 8  # In GB/s
     return bw_gbps
 
 
-def get_max_tensorcore_tflops(dtype, clock_rate, backend=None, device=None):
+def get_max_tensorcore_tflops(dtype, clock_rate, device=None):
     import torch
 
     from .runtime import driver
-    if not backend:
-        backend = runtime.backend.CUDA
     if not device:
         device = torch.cuda.current_device()
 
-    num_subcores = driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
+    num_subcores = driver.active.utils.get_device_properties(device)["multiprocessor_count"] * 4
     capability = torch.cuda.get_device_capability(device)
     if capability[0] < 8:
         assert dtype == torch.float16
@@ -464,16 +486,14 @@ def set_gpu_clock(ref_sm_clock=1350, ref_mem_clock=1215):
         subprocess.check_output(["nvidia-smi", "-i", "0", "-rmc"])
 
 
-def get_max_simd_tflops(dtype, clock_rate, backend=None, device=None):
+def get_max_simd_tflops(dtype, clock_rate, device=None):
     import torch
 
     from .runtime import driver
-    if not backend:
-        backend = runtime.backend.CUDA
     if not device:
         device = torch.cuda.current_device()
 
-    num_subcores = driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
+    num_subcores = driver.active.utils.get_device_properties(device)["multiprocessor_count"] * 4
     capability = torch.cuda.get_device_capability()
     if capability[0] < 8:
         if dtype == torch.float32:

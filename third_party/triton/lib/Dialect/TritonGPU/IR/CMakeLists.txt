@@ -1,6 +1,6 @@
-add_mlir_dialect_library(TritonGPUIR
+add_triton_library(TritonGPUIR
   Dialect.cpp
-  Traits.cpp
+  LinearLayoutConversions.cpp
   Types.cpp
 
   DEPENDS
@@ -10,4 +10,5 @@ add_mlir_dialect_library(TritonGPUIR
   LINK_LIBS PUBLIC
   MLIRGPUDialect
   TritonIR
+  TritonTools
 )

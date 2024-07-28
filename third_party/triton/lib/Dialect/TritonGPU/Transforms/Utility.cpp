@@ -1,22 +1,41 @@
 #include "triton/Analysis/Utility.h"
+
+#include <fstream>
+
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Analysis/AxisInfo.h"
+#include "triton/Conversion/TritonToTritonGPU/TritonToTritonGPUPass.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include <fstream>
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/Support/Debug.h"
+#define DEBUG_TYPE "ttg-utility"
+#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir {
 
+using namespace triton;
+
 SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
-                                                RankedTensorType type) {
+                                                RankedTensorType type,
+                                                int numWarps) {
   if (version == 1)
     return {16, 16};
-  else if (version == 2)
-    return {16, 8};
-  else if (version == 3) {
+  else if (version == 2) {
+    auto rank = shape.size();
+    SmallVector<unsigned, 3> ret(rank, 1);
+    ret[rank - 1] = 8;
+    ret[rank - 2] = 16;
+    return ret;
+  } else if (version == 3) {
     unsigned k = 256 / type.getElementTypeBitWidth();
     if (shape[0] % 64 != 0 || shape[1] % 8 != 0) {
       assert(false && "type not supported");
@@ -38,9 +57,13 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                      24, 16, 8});
     }
 
+    unsigned m = 16;
+    unsigned mWarps = std::max<unsigned>(shape[0] / m, 1);
+    unsigned nWarps = std::max<unsigned>(numWarps / mWarps, 1);
+    unsigned maxN = std::max<unsigned>(shape[1] / nWarps, 8);
     for (auto n : validN) {
-      if (shape[1] % n == 0) {
-        return {16, n, k};
+      if (shape[1] % n == 0 && n <= maxN) {
+        return {m, n, k};
       }
     }
 
@@ -56,34 +79,55 @@ bool isLoadFromTensorPtr(triton::LoadOp op) {
   return mlir::triton::isTensorPointerType(op.getPtr().getType());
 }
 
-bool isStoreToTensorPtr(triton::StoreOp op) {
-  return mlir::triton::isTensorPointerType(op.getPtr().getType());
+SmallVector<unsigned, 4> argSort(const SmallVector<int64_t> &arr) {
+  SmallVector<unsigned, 4> ret(arr.size());
+  std::iota(ret.begin(), ret.end(), 0);
+  std::stable_sort(ret.begin(), ret.end(),
+                   [&](unsigned x, unsigned y) { return arr[x] > arr[y]; });
+  return ret;
 }
 
-Operation *getFirstUser(Value v) {
-  DenseMap<Operation *, size_t> operationId;
-  v.getParentBlock()->walk<WalkOrder::PostOrder>(
-      [&](Operation *op) { operationId[op] = operationId.size(); });
-  size_t minId = std::numeric_limits<size_t>::max();
-  Operation *firstUser = nullptr;
-  for (Operation *user : v.getUsers()) {
-    assert(operationId.find(user) != operationId.end());
-    size_t userId = operationId[user];
-    if (userId < minId) {
-      minId = userId;
-      firstUser = user;
-    }
-  }
-  assert(firstUser);
-  return firstUser;
+Value getMemAccessPtr(Operation *op) {
+  if (auto ld = dyn_cast<triton::LoadOp>(op))
+    return ld.getPtr();
+  if (auto atomic = dyn_cast<triton::AtomicRMWOp>(op))
+    return atomic.getPtr();
+  if (auto atomic = dyn_cast<triton::AtomicCASOp>(op))
+    return atomic.getPtr();
+  if (auto copy = dyn_cast<triton::gpu::AsyncCopyGlobalToLocalOp>(op))
+    return copy.getSrc();
+  if (auto store = dyn_cast<triton::StoreOp>(op))
+    return store.getPtr();
+  return nullptr;
 }
 
-triton::gpu::SharedEncodingAttr getSharedEncoding(RankedTensorType tensorTy) {
-  auto blockedLayout =
-      tensorTy.getEncoding().cast<triton::gpu::BlockedEncodingAttr>();
-  return triton::gpu::SharedEncodingAttr::get(
-      tensorTy.getContext(), tensorTy.getShape(), blockedLayout.getOrder(),
-      blockedLayout.getCTALayout(), tensorTy.getElementType());
+unsigned getElementBitWidth(RankedTensorType type) {
+  auto typeForMem =
+      isa<PointerType>(type.getElementType())
+          ? cast<PointerType>(type.getElementType()).getPointeeType()
+          : type.getElementType();
+  return typeForMem.getIntOrFloatBitWidth();
+}
+
+unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
+                                 ModuleAxisInfoAnalysis &axisInfoAnalysis) {
+  Value val = getMemAccessPtr(op);
+  auto ty = cast<RankedTensorType>(val.getType());
+  auto shapePerCTA = triton::gpu::getShapePerCTA(ty);
+  AxisInfo &valInfo = *axisInfoAnalysis.getAxisInfo(val);
+  unsigned elemNumBits = getElementBitWidth(ty);
+  unsigned elemNumBytes = std::max(elemNumBits / 8, 1u);
+  unsigned maxMultipleBytes = valInfo.getDivisibility(order[0]);
+  unsigned maxMultiple = std::max(maxMultipleBytes / elemNumBytes, 1u);
+  unsigned maxContig =
+      std::min(valInfo.getContiguity(order[0]), shapePerCTA[order[0]]);
+  unsigned alignment = std::min(maxMultiple, maxContig);
+  unsigned currPerThread = std::min(alignment, 128 / elemNumBits);
+  LDBG("elemNumBytes: " << elemNumBytes
+                        << ", divisibility: " << maxMultipleBytes
+                        << ", contig: " << valInfo.getContiguity(order[0])
+                        << ", alignment: " << alignment);
+  return currPerThread;
 }
 
 //===----------------------------------------------------------------------===//
@@ -146,7 +190,7 @@ void GraphDumper::dumpToFile(triton::FuncOp func,
 std::string GraphDumper::getShapeStr(const Type &type) const {
   std::ostringstream oss;
   oss << "[";
-  if (auto tensorTy = type.dyn_cast<RankedTensorType>()) {
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
     auto shape = tensorTy.getShape();
     for (unsigned i = 0; i < shape.size(); ++i) {
       if (i > 0)
@@ -194,7 +238,7 @@ std::string GraphDumper::emitValueNode(Value value) const {
   NodeInfo info = onValue(value);
   if (info.find("label") == info.end()) {
     std::string shapeStr = getShapeStr(value.getType());
-    if (auto arg = value.dyn_cast<BlockArgument>())
+    if (auto arg = mlir::dyn_cast<BlockArgument>(value))
       info["label"] =
           "BlockArg" + std::to_string(arg.getArgNumber()) + " " + shapeStr;
     else
@@ -220,17 +264,17 @@ GraphDumper::NodeInfo GraphLayoutMarker::onValue(Value value) const {
 }
 
 std::string GraphLayoutMarker::getColor(const Type &type) const {
-  if (auto tensorTy = type.dyn_cast<RankedTensorType>()) {
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
     auto layout = tensorTy.getEncoding();
-    if (layout.isa<triton::gpu::BlockedEncodingAttr>())
+    if (isa<triton::gpu::BlockedEncodingAttr>(layout))
       return "green";
-    else if (layout.isa<triton::gpu::SliceEncodingAttr>())
+    else if (isa<triton::gpu::SliceEncodingAttr>(layout))
       return "yellow";
-    else if (layout.isa<triton::gpu::MmaEncodingAttr>())
+    else if (isa<triton::gpu::NvidiaMmaEncodingAttr>(layout))
       return "lightslateblue";
-    else if (layout.isa<triton::gpu::DotOperandEncodingAttr>())
+    else if (isa<triton::gpu::DotOperandEncodingAttr>(layout))
       return "orange";
-    else if (layout.isa<triton::gpu::SharedEncodingAttr>())
+    else if (isa<triton::gpu::SharedEncodingAttr>(layout))
       return "orangered";
     else {
       llvm::report_fatal_error("Unrecognized layout");
@@ -250,7 +294,7 @@ static std::optional<Attribute> inferDstEncoding(triton::ReduceOp op,
 
 static std::optional<Attribute> inferDstEncoding(triton::ExpandDimsOp op,
                                                  Attribute encoding) {
-  auto sliceEncoding = encoding.dyn_cast<triton::gpu::SliceEncodingAttr>();
+  auto sliceEncoding = mlir::dyn_cast<triton::gpu::SliceEncodingAttr>(encoding);
   if (!sliceEncoding)
     return std::nullopt;
   if (op.getAxis() != sliceEncoding.getDim())
@@ -258,9 +302,33 @@ static std::optional<Attribute> inferDstEncoding(triton::ExpandDimsOp op,
   return sliceEncoding.getParent();
 }
 
+static std::optional<Attribute> inferDstEncoding(JoinOp op, Attribute srcEnc) {
+  Attribute dstEnc;
+  if (srcEnc.getDialect()
+          .getRegisteredInterface<DialectInferLayoutInterface>()
+          ->inferJoinOpEncoding(srcEnc, dstEnc,
+                                /*loc=*/std::nullopt)
+          .succeeded()) {
+    return dstEnc;
+  }
+  return std::nullopt;
+}
+
+static std::optional<Attribute> inferDstEncoding(SplitOp op, Attribute srcEnc) {
+  Attribute dstEnc;
+  if (srcEnc.getDialect()
+          .getRegisteredInterface<DialectInferLayoutInterface>()
+          ->inferSplitOpEncoding(srcEnc, dstEnc,
+                                 /*loc=*/std::nullopt)
+          .succeeded()) {
+    return dstEnc;
+  }
+  return std::nullopt;
+}
+
 static std::optional<Attribute> inferSrcEncoding(triton::ReduceOp op,
                                                  Attribute encoding) {
-  auto sliceEncoding = encoding.dyn_cast<triton::gpu::SliceEncodingAttr>();
+  auto sliceEncoding = mlir::dyn_cast<triton::gpu::SliceEncodingAttr>(encoding);
   if (!sliceEncoding)
     return std::nullopt;
   if (op.getAxis() != sliceEncoding.getDim())
@@ -274,24 +342,165 @@ static std::optional<Attribute> inferSrcEncoding(triton::ExpandDimsOp op,
                                              encoding);
 }
 
+static std::optional<Attribute> inferSrcEncoding(JoinOp op, Attribute dstEnc) {
+  // Split is the inverse of join.
+  Attribute srcEnc;
+  if (dstEnc.getDialect()
+          .getRegisteredInterface<DialectInferLayoutInterface>()
+          ->inferSplitOpEncoding(dstEnc, srcEnc, /*loc=*/std::nullopt)
+          .succeeded()) {
+    return srcEnc;
+  }
+  return std::nullopt;
+}
+
+static std::optional<Attribute> inferSrcEncoding(SplitOp op, Attribute dstEnc) {
+  // Join is the inverse of split.
+  Attribute srcEnc;
+  if (dstEnc.getDialect()
+          .getRegisteredInterface<DialectInferLayoutInterface>()
+          ->inferJoinOpEncoding(dstEnc, srcEnc, /*loc=*/std::nullopt)
+          .succeeded()) {
+    return srcEnc;
+  }
+  return std::nullopt;
+}
+
+static std::optional<Attribute>
+inferTransOpDstEncoding(Attribute srcEnc, ArrayRef<int32_t> order) {
+  // Simply forward to the existing inferTransOpEncoding function.
+  Attribute retEncoding;
+  if (succeeded(
+          srcEnc.getDialect()
+              .getRegisteredInterface<triton::DialectInferLayoutInterface>()
+              ->inferTransOpEncoding(srcEnc, order, retEncoding))) {
+    return retEncoding;
+  }
+  return std::nullopt;
+}
+
+static std::optional<Attribute> inferDstEncoding(triton::TransOp op,
+                                                 Attribute encoding) {
+  return inferTransOpDstEncoding(encoding, op.getOrder());
+}
+
+static std::optional<Attribute> inferSrcEncoding(triton::TransOp op,
+                                                 Attribute encoding) {
+  // We want to solve for srcEnc in
+  //   transpose(srcEnc, order) -> dstEnc.
+  // Given the identity
+  //   transpose(transpose(x, order), inverse(order)) == x,
+  // we can see this is equivalent to
+  //   transpose(dstEnc, inverse(order)) -> srcEnc.
+  return inferTransOpDstEncoding(encoding,
+                                 triton::inversePermutation(op.getOrder()));
+}
+
+static std::optional<Attribute>
+inferReshapeOpDstEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
+                          ArrayRef<int64_t> dstShape, bool allowReorder) {
+  // We don't do anything smart to allow-reorder reshapes here.  They are
+  // handled in OptimizeThreadLocality.
+  if (allowReorder)
+    return std::nullopt;
+
+  Attribute dstEnc;
+  if (succeeded(
+          srcEnc.getDialect()
+              .getRegisteredInterface<triton::DialectInferLayoutInterface>()
+              ->inferReshapeOpNoReorderEncoding(
+                  srcShape, srcEnc, dstShape, dstEnc, /*loc=*/std::nullopt))) {
+    return dstEnc;
+  }
+  return std::nullopt;
+}
+
+static std::optional<Attribute> inferDstEncoding(triton::ReshapeOp op,
+                                                 Attribute encoding) {
+  return inferReshapeOpDstEncoding(op.getSrc().getType().getShape(), encoding,
+                                   op.getType().getShape(),
+                                   op.getAllowReorder());
+}
+
+static std::optional<Attribute> inferSrcEncoding(triton::ReshapeOp op,
+                                                 Attribute encoding) {
+  // The encoding of x given the encoding of y in `reshape(x) -> y` is the same
+  // as the encoding of x given the encoding of y in `reshape(y) -> x`.  It's an
+  // invariant of inferReshapeOpNoReorderEncoding that it's symmetric in this
+  // way.
+  return inferReshapeOpDstEncoding(op.getType().getShape(), encoding,
+                                   op.getSrc().getType().getShape(),
+                                   op.getAllowReorder());
+}
+
 std::optional<Attribute> inferSrcEncoding(Operation *op, Attribute encoding) {
+  if (isa<triton::ScanOp>(op)) {
+    // Scan only supports blocked encoding at the moment.
+    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+      return std::nullopt;
+  }
+  if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
+      op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
+      op->hasTrait<mlir::OpTrait::Elementwise>() ||
+      isa<scf::WhileOp, scf::YieldOp, scf::ConditionOp,
+          nvidia_gpu::WarpGroupDotWaitOp>(op)) {
+    return encoding;
+  }
+
   if (auto reduceOp = dyn_cast<triton::ReduceOp>(op))
     return inferSrcEncoding(reduceOp, encoding);
   if (auto expand = dyn_cast<triton::ExpandDimsOp>(op))
     return inferSrcEncoding(expand, encoding);
-  if (isa<triton::ViewOp, triton::CatOp>(op))
-    return std::nullopt;
-  return encoding;
+  if (auto join = dyn_cast<triton::JoinOp>(op))
+    return inferSrcEncoding(join, encoding);
+  if (auto split = dyn_cast<triton::SplitOp>(op))
+    return inferSrcEncoding(split, encoding);
+  if (auto trans = dyn_cast<triton::TransOp>(op))
+    return inferSrcEncoding(trans, encoding);
+  if (auto reshape = dyn_cast<triton::ReshapeOp>(op))
+    return inferSrcEncoding(reshape, encoding);
+
+  return std::nullopt;
 }
 
 std::optional<Attribute> inferDstEncoding(Operation *op, Attribute encoding) {
+  if (isa<triton::ScanOp>(op)) {
+    if (!isa<triton::gpu::BlockedEncodingAttr>(encoding))
+      return std::nullopt;
+  }
+  if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() ||
+      op->hasTrait<mlir::OpTrait::SameLoadStoreOperandsAndResultEncoding>() ||
+      op->hasTrait<mlir::OpTrait::Elementwise>() ||
+      isa<scf::WhileOp, scf::ForOp, scf::YieldOp, scf::ConditionOp,
+          nvidia_gpu::WarpGroupDotWaitOp>(op))
+    return encoding;
   if (auto reduceOp = dyn_cast<triton::ReduceOp>(op))
     return inferDstEncoding(reduceOp, encoding);
   if (auto expand = dyn_cast<triton::ExpandDimsOp>(op))
     return inferDstEncoding(expand, encoding);
-  if (isa<triton::ViewOp, triton::CatOp>(op))
-    return std::nullopt;
-  return encoding;
+  if (auto join = dyn_cast<triton::JoinOp>(op))
+    return inferDstEncoding(join, encoding);
+  if (auto split = dyn_cast<triton::SplitOp>(op))
+    return inferDstEncoding(split, encoding);
+  if (auto trans = dyn_cast<triton::TransOp>(op))
+    return inferDstEncoding(trans, encoding);
+  if (auto reshape = dyn_cast<triton::ReshapeOp>(op))
+    return inferDstEncoding(reshape, encoding);
+
+  return std::nullopt;
+}
+
+bool isSingleValue(Value value) {
+  // Don't consider load as expensive if it is loading a scalar.
+  if (auto tensorTy = dyn_cast<RankedTensorType>(value.getType()))
+    return tensorTy.getNumElements() == 1;
+  // TODO: Handle other cases.
+  // For example, when ptr is a tensor of single value.
+  // It means that ptr is a resultant of broadcast or generated through
+  // a chain of broadcast and other operations.
+  // Rematerialize it without considering contiguous memory access pattern is
+  // fine.
+  return true;
 }
 
 bool isExpensiveLoadOrStore(Operation *op) {
@@ -305,7 +514,7 @@ bool isExpensiveLoadOrStore(Operation *op) {
     return false;
   // Case 2b: Tensor of pointers has more threads than elements
   // we can presume a high hit-rate that makes it cheap to load
-  auto ptrType = op->getOperand(0).getType().cast<RankedTensorType>();
+  auto ptrType = cast<RankedTensorType>(op->getOperand(0).getType());
   auto mod = op->getParentOfType<ModuleOp>();
   int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
   int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
@@ -321,8 +530,7 @@ bool isExpensiveToRemat(Operation *op, Attribute &targetEncoding) {
     return isExpensiveLoadOrStore(op);
   if (isa<triton::CatOp>(op))
     return triton::gpu::isExpensiveCat(cast<triton::CatOp>(op), targetEncoding);
-  if (isa<tensor::ExtractSliceOp, triton::gpu::AllocTensorOp,
-          triton::gpu::InsertSliceAsyncOp, triton::AtomicRMWOp,
+  if (isa<triton::gpu::AsyncCopyGlobalToLocalOp, triton::AtomicRMWOp,
           triton::AtomicCASOp, triton::DotOp>(op))
     return true;
   if (isa<scf::YieldOp, scf::ForOp, scf::IfOp, scf::WhileOp, scf::ConditionOp>(
@@ -336,27 +544,32 @@ bool canFoldIntoConversion(Operation *op, Attribute targetEncoding) {
     return !triton::gpu::isExpensiveCat(cast<triton::CatOp>(op),
                                         targetEncoding);
   if (auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
-    if (targetEncoding.isa<triton::gpu::MmaEncodingAttr>()) {
-      auto srcEncoding =
-          convert.getOperand().getType().cast<RankedTensorType>().getEncoding();
+    if (mlir::isa<triton::gpu::NvidiaMmaEncodingAttr>(targetEncoding)) {
+      auto srcEncoding = convert.getSrc().getType().getEncoding();
       if (targetEncoding != srcEncoding)
         return false;
     }
     return true;
   }
-  if (auto view = dyn_cast<triton::ViewOp>(op)) {
-    auto viewDstType = view.getType().cast<RankedTensorType>();
-    RankedTensorType newDstType = RankedTensorType::get(
-        viewDstType.getShape(), viewDstType.getElementType(), targetEncoding);
-    return !triton::gpu::isExpensiveView(view.getOperand().getType(),
+
+  if (auto reshape = dyn_cast<triton::ReshapeOp>(op)) {
+    auto reshapeDstType = reshape.getType();
+    RankedTensorType newDstType =
+        RankedTensorType::get(reshapeDstType.getShape(),
+                              reshapeDstType.getElementType(), targetEncoding);
+    return reshape.getAllowReorder() &&
+           !reshape.getEfficientLayout().has_value() &&
+           !triton::gpu::isExpensiveView(reshape.getSrc().getType(),
                                          newDstType);
   }
   return isa<triton::gpu::ConvertLayoutOp, arith::ConstantOp,
-             triton::MakeRangeOp, triton::SplatOp>(op);
+             triton::MakeRangeOp, triton::SplatOp, triton::HistogramOp,
+             triton::gpu::LocalAllocOp, triton::gpu::LocalStoreOp>(op);
 }
 
-scf::ForOp replaceForOpWithNewSignature(OpBuilder &rewriter, scf::ForOp loop,
-                                        ValueRange newIterOperands) {
+scf::ForOp replaceForOpWithNewSignature(
+    RewriterBase &rewriter, scf::ForOp loop, ValueRange newIterOperands,
+    SmallVectorImpl<std::tuple<Value, Value>> &replacements) {
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(loop);
 
@@ -366,6 +579,7 @@ scf::ForOp replaceForOpWithNewSignature(OpBuilder &rewriter, scf::ForOp loop,
   scf::ForOp newLoop = rewriter.create<scf::ForOp>(
       loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(), loop.getStep(),
       operands);
+  newLoop->setAttrs(loop->getAttrs());
   newLoop.getBody()->erase();
   newLoop.getRegion().getBlocks().splice(
       newLoop.getRegion().getBlocks().begin(), loop.getRegion().getBlocks());
@@ -374,8 +588,43 @@ scf::ForOp replaceForOpWithNewSignature(OpBuilder &rewriter, scf::ForOp loop,
 
   for (auto it : llvm::zip(loop.getResults(), newLoop.getResults().take_front(
                                                   loop.getNumResults())))
-    std::get<0>(it).replaceAllUsesWith(std::get<1>(it));
+    replacements.push_back(it);
   return newLoop;
+}
+
+scf::ForOp replaceForOpWithNewSignature(RewriterBase &rewriter, scf::ForOp loop,
+                                        ValueRange newIterOperands) {
+  SmallVector<std::tuple<Value, Value>> replacements;
+  auto newForOp = replaceForOpWithNewSignature(rewriter, loop, newIterOperands,
+                                               replacements);
+  for (auto &kv : replacements) {
+    rewriter.replaceAllUsesWith(std::get<0>(kv), std::get<1>(kv));
+  }
+  return newForOp;
+}
+
+scf::IfOp replaceIfOpWithNewSignature(
+    RewriterBase &rewriter, scf::IfOp ifOp, TypeRange newResultTypes,
+    SmallVectorImpl<std::tuple<Value, Value>> &replacements) {
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(ifOp);
+
+  // Create a new loop before the existing one, with the extra operands.
+  auto resultTypes = llvm::to_vector<4>(ifOp.getResults().getTypes());
+  resultTypes.append(newResultTypes.begin(), newResultTypes.end());
+  scf::IfOp newIf = rewriter.create<scf::IfOp>(
+      ifOp.getLoc(), resultTypes, ifOp.getCondition(), /*withElse=*/true);
+  newIf->setAttrs(ifOp->getAttrs());
+
+  rewriter.inlineBlockBefore(ifOp.thenBlock(), newIf.thenBlock(),
+                             newIf.thenBlock()->begin());
+  rewriter.inlineBlockBefore(ifOp.elseBlock(), newIf.elseBlock(),
+                             newIf.elseBlock()->begin());
+
+  for (auto it : llvm::zip(ifOp.getResults(),
+                           newIf.getResults().take_front(ifOp.getNumResults())))
+    replacements.push_back(it);
+  return newIf;
 }
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
@@ -392,8 +641,8 @@ Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
 
   if (newOp->getNumResults() == 0)
     return newOp;
-  auto origType = op->getResult(0).getType().dyn_cast<RankedTensorType>();
-  auto argType = newOp->getOperand(0).getType().dyn_cast<RankedTensorType>();
+  auto origType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  auto argType = dyn_cast<RankedTensorType>(newOp->getOperand(0).getType());
   if (!origType || !argType)
     return newOp;
   auto newType = RankedTensorType::get(
@@ -414,25 +663,65 @@ Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
   return newOp;
 }
 
+// Check if the convert will be a no-op in codegen.
+static bool isFreeConvert(Operation *op) {
+  auto convertOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op);
+  if (!convertOp)
+    return false;
+  return isMmaToMmaShortcut(convertOp.getSrc().getType(), convertOp.getType());
+}
+
 LogicalResult
 getConvertBackwardSlice(Value root, SetVector<Value> &slice,
                         Attribute rootEncoding,
                         DenseMap<Value, Attribute> &layout,
                         std::function<bool(Operation *)> stopPropagation) {
+  DenseSet<Value> visited;
   SmallVector<std::pair<Value, Attribute>> queue = {{root, rootEncoding}};
   while (!queue.empty()) {
     auto [currentValue, encoding] = queue.back();
     queue.pop_back();
-    if (!currentValue.getType().isa<RankedTensorType>())
+    if (!visited.insert(currentValue).second)
+      continue;
+    if (!isa<RankedTensorType>(currentValue.getType()))
       continue;
     // Skip propagating through for op results for now.
     // TODO: enable this based on needs.
     if (currentValue.getDefiningOp<scf::ForOp>())
       return failure();
     slice.insert(currentValue);
+    if (layout.find(currentValue) != layout.end()) {
+      if (layout[currentValue] != encoding)
+        return failure();
+    }
     layout[currentValue] = encoding;
+
+    if (auto ifOp = currentValue.getDefiningOp<scf::IfOp>()) {
+      auto results = ifOp.getResults();
+      unsigned argIdx = mlir::cast<OpResult>(currentValue).getResultNumber();
+
+      auto thenValue = ifOp.thenYield().getOperand(argIdx);
+      auto elseValue = ifOp.elseYield().getOperand(argIdx);
+
+      queue.push_back({thenValue, encoding});
+      queue.push_back({elseValue, encoding});
+
+      continue;
+    }
     if (auto *definingOp = currentValue.getDefiningOp()) {
-      if (canFoldIntoConversion(definingOp, encoding))
+      // If the op has multiple results we need to update all results layout.
+      for (Value result : definingOp->getResults()) {
+        if (result == currentValue || !isa<RankedTensorType>(result.getType()))
+          continue;
+        if (layout.find(result) != layout.end()) {
+          if (layout[result] != encoding)
+            return failure();
+          continue;
+        }
+        layout[result] = encoding;
+      }
+      if (!isFreeConvert(definingOp) &&
+          canFoldIntoConversion(definingOp, encoding))
         continue;
       if (stopPropagation && stopPropagation(definingOp))
         continue;
@@ -451,10 +740,10 @@ getConvertBackwardSlice(Value root, SetVector<Value> &slice,
     Block *block = blockArg.getOwner();
     Operation *parentOp = block->getParentOp();
     if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
-      OpOperand &initOperand = forOp.getOpOperandForRegionIterArg(blockArg);
+      OpOperand *initOperand = forOp.getTiedLoopInit(blockArg);
       Value yieldOperand = forOp.getBody()->getTerminator()->getOperand(
           blockArg.getArgNumber() - forOp.getNumInductionVars());
-      queue.push_back({initOperand.get(), encoding});
+      queue.push_back({initOperand->get(), encoding});
       queue.push_back({yieldOperand, encoding});
       continue;
     }
@@ -472,7 +761,7 @@ SmallVector<Value> delinearize(OpBuilder &b, Location loc, Value linear,
                                ArrayRef<unsigned> order) {
   unsigned rank = shape.size();
   assert(rank == order.size());
-  auto reordered = reorder(shape, order);
+  auto reordered = triton::applyPermutation(shape, order);
   auto reorderedMultiDim = delinearize(b, loc, linear, reordered);
   SmallVector<Value> multiDim(rank);
   for (unsigned i = 0; i < rank; ++i) {
@@ -502,8 +791,8 @@ SmallVector<Value> delinearize(OpBuilder &b, Location loc, Value linear,
 
 Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
                 ArrayRef<unsigned> shape, ArrayRef<unsigned> order) {
-  return linearize(b, loc, reorder<Value>(multiDim, order),
-                   reorder<unsigned>(shape, order));
+  return linearize(b, loc, triton::applyPermutation(multiDim, order),
+                   triton::applyPermutation(shape, order));
 }
 
 Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
@@ -520,6 +809,34 @@ Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
     }
   }
   return linear;
+}
+
+bool isPureUnaryInlineAsm(Operation *op) {
+  auto inlineAsmOp = dyn_cast<ElementwiseInlineAsmOp>(op);
+  if (!inlineAsmOp)
+    return false;
+  return op->getNumOperands() == 1 && op->getNumResults() == 1 &&
+         inlineAsmOp.getPure();
+}
+
+int getNVIDIAComputeCapability(Operation *module) {
+  assert(module->hasAttr(triton::AttrTargetName) &&
+         "Expected a target attribute on the module operation");
+
+  StringAttr targetAttr =
+      cast<StringAttr>(module->getAttr(triton::AttrTargetName));
+
+  StringRef ref = targetAttr.strref();
+  assert(ref.starts_with("cuda:") &&
+         "expected target attribute to be prefixed with \"cuda:\"");
+
+  StringRef capabilityStr = ref.drop_front(5); // drop the "cuda:"
+  int computeCapability;
+  bool parseError = capabilityStr.getAsInteger(10, computeCapability);
+  assert(!parseError &&
+         "invalid compute capability string in target attribute");
+
+  return computeCapability;
 }
 
 namespace {
@@ -565,8 +882,8 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
     while (!queue.empty()) {
       Value value = queue.pop_back_val();
       if (auto nestedFor = value.getDefiningOp<scf::ForOp>()) {
-        auto result = value.cast<OpResult>();
-        OpOperand &forOperand = nestedFor.getOpOperandForResult(result);
+        auto result = mlir::cast<OpResult>(value);
+        OpOperand &forOperand = *nestedFor.getTiedLoopInit(result);
         markLive(forOperand.get());
         auto nestedYieldOp =
             cast<scf::YieldOp>(nestedFor.getBody()->getTerminator());
@@ -576,7 +893,7 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
         continue;
       }
       if (auto nestedIf = value.getDefiningOp<scf::IfOp>()) {
-        auto result = value.cast<OpResult>();
+        auto result = mlir::cast<OpResult>(value);
         for (scf::YieldOp nestedYieldOp :
              {nestedIf.thenYield(), nestedIf.elseYield()}) {
           Value nestedYieldOperand =
@@ -595,7 +912,7 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
       }
       // If an argument block is live then the associated yield operand and
       // forOp operand are live.
-      auto arg = value.cast<BlockArgument>();
+      auto arg = mlir::cast<BlockArgument>(value);
       if (auto forOwner = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())) {
         if (arg.getArgNumber() < forOwner.getNumInductionVars())
           continue;
@@ -612,11 +929,33 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
         continue;
       if (yieldOperand.value() == block.getArgument(yieldOperand.index() + 1))
         continue;
+
+      // The yield operand might live outside the loop, e.g.
+      //   %init = ...
+      //   %x = ...
+      //   %y = for iter_args(%unused = %init) {
+      //     yield %x
+      //   }
+      //
+      // In this case, the loop returns %x if it runs 1 or more times, and
+      // otherwise it returns %init.  We cowardly refuse to remove this operand
+      // from the yield.  (We could, but we'd need to prove that the loop runs 0
+      // or >=1 times.)
+      //
+      // As a special case, if it doesn't matter whether the loop runs 0 or >=1
+      // times (because the loop returns the same value in both cases) then we
+      // can still mark the operand as dead. This occurs in the above example
+      // when %init is the same as %x.
+      if (!forOp->isAncestor(
+              yieldOperand.value().getParentRegion()->getParentOp()) &&
+          yieldOperand.value() != forOp.getInitArgs()[yieldOperand.index()])
+        continue;
+
       deadArg.push_back(yieldOperand.index());
     }
     if (deadArg.empty())
       return failure();
-    rewriter.updateRootInPlace(forOp, [&]() {
+    rewriter.modifyOpInPlace(forOp, [&]() {
       // For simplicity we just change the dead yield operand to use the
       // associated argument and leave the operations and argument removal to
       // dead code elimination.
@@ -634,231 +973,5 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
 void populateForOpDeadArgumentElimination(RewritePatternSet &patterns) {
   patterns.add<ForOpDeadArgElimination>(patterns.getContext());
 }
-
-// mfma instruction selection logic
-static MfmaTypeId convertTypesToId(mlir::Type dataTypeA, mlir::Type dataTypeB) {
-  if (dataTypeA.isF32() && dataTypeB.isF32()) {
-    return MfmaTypeId::Fp32TyId;
-  }
-  if (dataTypeA.isF16() && dataTypeB.isF16()) {
-    return MfmaTypeId::Fp16TyId;
-  }
-  if (dataTypeA.isBF16() && dataTypeB.isBF16()) {
-    return MfmaTypeId::Bf16TyId;
-  }
-  if (dataTypeA.isInteger(8) && dataTypeB.isInteger(8)) {
-    return MfmaTypeId::I8TyId;
-  }
-  if (dataTypeA.isFloat8E4M3FNUZ() && dataTypeB.isFloat8E4M3FNUZ()) {
-    return MfmaTypeId::Fp8Fp8TyId;
-  }
-  if (dataTypeA.isFloat8E4M3FNUZ() && dataTypeB.isFloat8E5M2FNUZ()) {
-    return MfmaTypeId::Fp8Bf8TyId;
-  }
-  if (dataTypeA.isFloat8E5M2FNUZ() && dataTypeB.isFloat8E4M3FNUZ()) {
-    return MfmaTypeId::Bf8Fp8TyId;
-  }
-  if (dataTypeA.isFloat8E5M2FNUZ() && dataTypeB.isFloat8E5M2FNUZ()) {
-    return MfmaTypeId::Bf8Bf8TyId;
-  }
-  llvm_unreachable("Unsupported input argument type.");
-}
-
-using MfmaInsnGroupMap = llvm::DenseMap<MfmaInsnGroupSelectKey, MfmaInsnAttr,
-                                        MfmaInsnGroupSelectKeyInfo>;
-
-auto getMfmaInsnGroupAttrMap = []() -> const MfmaInsnGroupMap & {
-  static MfmaInsnGroupMap MfmaInsnMap{
-      // f32
-      // mfma_f32_32x32x2f32
-      {{32, 32, MfmaTypeId::Fp32TyId, 1},
-       {32, 32, 2, 1, ROCDL::mfma_f32_32x32x2f32::getOperationName()}},
-      {{32, 32, MfmaTypeId::Fp32TyId, 2},
-       {32, 32, 2, 1, ROCDL::mfma_f32_32x32x2f32::getOperationName()}},
-      {{32, 32, MfmaTypeId::Fp32TyId, 3},
-       {32, 32, 2, 1, ROCDL::mfma_f32_32x32x2f32::getOperationName()}},
-      // mfma_f32_16x16x4f32
-      {{16, 16, MfmaTypeId::Fp32TyId, 1},
-       {16, 16, 4, 1, ROCDL::mfma_f32_16x16x4f32::getOperationName()}},
-      {{16, 16, MfmaTypeId::Fp32TyId, 2},
-       {16, 16, 4, 1, ROCDL::mfma_f32_16x16x4f32::getOperationName()}},
-      {{16, 16, MfmaTypeId::Fp32TyId, 3},
-       {16, 16, 4, 1, ROCDL::mfma_f32_16x16x4f32::getOperationName()}},
-      // mfma_f32_4x4x1f32
-      {{4, 4, MfmaTypeId::Fp32TyId, 1},
-       {4, 4, 16, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{4, 4, MfmaTypeId::Fp32TyId, 2},
-       {4, 4, 16, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{4, 64, MfmaTypeId::Fp32TyId, 1},
-       {4, 64, 1, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{4, 64, MfmaTypeId::Fp32TyId, 2},
-       {4, 64, 1, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{64, 4, MfmaTypeId::Fp32TyId, 1},
-       {64, 4, 1, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{64, 4, MfmaTypeId::Fp32TyId, 2},
-       {64, 4, 1, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      // mfma_f32_4x4x1_16B_f32
-      {{4, 4, MfmaTypeId::Fp32TyId, 3},
-       {4, 4, 16, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{4, 64, MfmaTypeId::Fp32TyId, 3},
-       {4, 64, 1, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      {{64, 4, MfmaTypeId::Fp32TyId, 3},
-       {64, 4, 1, 1, ROCDL::mfma_f32_4x4x1f32::getOperationName()}},
-      // f16
-      // mfma_f32_32x32x8f16
-      {{32, 32, MfmaTypeId::Fp16TyId, 1},
-       {32, 32, 8, 4, ROCDL::mfma_f32_32x32x8f16::getOperationName()}},
-      {{32, 32, MfmaTypeId::Fp16TyId, 2},
-       {32, 32, 8, 4, ROCDL::mfma_f32_32x32x8f16::getOperationName()}},
-      {{32, 32, MfmaTypeId::Fp16TyId, 3},
-       {32, 32, 8, 4, ROCDL::mfma_f32_32x32x8f16::getOperationName()}},
-      // mfma_f32_16x16x16xf16
-      {{16, 16, MfmaTypeId::Fp16TyId, 1},
-       {16, 16, 16, 4, ROCDL::mfma_f32_16x16x16f16::getOperationName()}},
-      {{16, 16, MfmaTypeId::Fp16TyId, 2},
-       {16, 16, 16, 4, ROCDL::mfma_f32_16x16x16f16::getOperationName()}},
-      {{16, 16, MfmaTypeId::Fp16TyId, 3},
-       {16, 16, 16, 4, ROCDL::mfma_f32_16x16x16f16::getOperationName()}},
-      // mfma_f32_4x4x4f16
-      {{4, 4, MfmaTypeId::Fp16TyId, 1},
-       {4, 4, 64, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{4, 4, MfmaTypeId::Fp16TyId, 2},
-       {4, 4, 64, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{4, 4, MfmaTypeId::Fp16TyId, 3},
-       {4, 4, 64, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{4, 64, MfmaTypeId::Fp16TyId, 1},
-       {4, 64, 4, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{4, 64, MfmaTypeId::Fp16TyId, 2},
-       {4, 64, 4, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{4, 64, MfmaTypeId::Fp16TyId, 3},
-       {4, 64, 4, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{64, 4, MfmaTypeId::Fp16TyId, 1},
-       {64, 4, 4, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{64, 4, MfmaTypeId::Fp16TyId, 2},
-       {64, 4, 4, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      {{64, 4, MfmaTypeId::Fp16TyId, 3},
-       {64, 4, 4, 4, ROCDL::mfma_f32_4x4x4f16::getOperationName()}},
-      // bf16
-      // mfma_f32_32x32x4_bf16
-      {{32, 32, MfmaTypeId::Bf16TyId, 1},
-       {32, 32, 4, 2, ROCDL::mfma_f32_32x32x4bf16::getOperationName()}},
-      // mfma_f32_32x32x8_bf16_1K
-      {{32, 32, MfmaTypeId::Bf16TyId, 2},
-       {32, 32, 8, 4, ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName()}},
-      {{32, 32, MfmaTypeId::Bf16TyId, 3},
-       {32, 32, 8, 4, ROCDL::mfma_f32_32x32x8bf16_1k::getOperationName()}},
-      // mfma_f32_16x16x8_bf16
-      {{16, 16, MfmaTypeId::Bf16TyId, 1},
-       {16, 16, 8, 2, ROCDL::mfma_f32_16x16x8bf16::getOperationName()}},
-      // mfma_f32_16x16x16_bf16_1K
-      {{16, 16, MfmaTypeId::Bf16TyId, 2},
-       {16, 16, 16, 4, ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName()}},
-      {{16, 16, MfmaTypeId::Bf16TyId, 3},
-       {16, 16, 16, 4, ROCDL::mfma_f32_16x16x16bf16_1k::getOperationName()}},
-      // mfma_f32_4x4x2_bf16
-      {{4, 4, MfmaTypeId::Bf16TyId, 1},
-       {4, 4, 32, 2, ROCDL::mfma_f32_4x4x2bf16::getOperationName()}},
-      {{4, 64, MfmaTypeId::Bf16TyId, 1},
-       {4, 64, 2, 2, ROCDL::mfma_f32_4x4x2bf16::getOperationName()}},
-      {{64, 4, MfmaTypeId::Bf16TyId, 1},
-       {64, 4, 2, 2, ROCDL::mfma_f32_4x4x2bf16::getOperationName()}},
-      // mfma_f32_4x4x4_bf16_1K
-      {{4, 4, MfmaTypeId::Bf16TyId, 2},
-       {4, 4, 64, 4, ROCDL::mfma_f32_4x4x4bf16_1k::getOperationName()}},
-      {{4, 4, MfmaTypeId::Bf16TyId, 3},
-       {4, 4, 64, 4, ROCDL::mfma_f32_4x4x4bf16_1k::getOperationName()}},
-      {{4, 64, MfmaTypeId::Bf16TyId, 2},
-       {4, 64, 4, 4, ROCDL::mfma_f32_4x4x4bf16_1k::getOperationName()}},
-      {{4, 64, MfmaTypeId::Bf16TyId, 3},
-       {4, 64, 4, 4, ROCDL::mfma_f32_4x4x4bf16_1k::getOperationName()}},
-      {{64, 4, MfmaTypeId::Bf16TyId, 2},
-       {64, 4, 4, 4, ROCDL::mfma_f32_4x4x4bf16_1k::getOperationName()}},
-      {{64, 4, MfmaTypeId::Bf16TyId, 3},
-       {64, 4, 4, 4, ROCDL::mfma_f32_4x4x4bf16_1k::getOperationName()}},
-      // int8
-      // mfma_i32_32x32x8i8
-      {{32, 32, MfmaTypeId::I8TyId, 1},
-       {32, 32, 8, 4, ROCDL::mfma_i32_32x32x8i8::getOperationName()}},
-      {{32, 32, MfmaTypeId::I8TyId, 2},
-       {32, 32, 8, 4, ROCDL::mfma_i32_32x32x8i8::getOperationName()}},
-      // mfma_i32_32x32x16i8
-      {{32, 32, MfmaTypeId::I8TyId, 3},
-       {32, 32, 16, 8, ROCDL::mfma_i32_32x32x16_i8::getOperationName()}},
-      // mfma_i32_16x16x16i8
-      {{16, 16, MfmaTypeId::I8TyId, 1},
-       {16, 16, 16, 4, ROCDL::mfma_i32_16x16x16i8::getOperationName()}},
-      {{16, 16, MfmaTypeId::I8TyId, 2},
-       {16, 16, 16, 4, ROCDL::mfma_i32_16x16x16i8::getOperationName()}},
-      // mfma_i32_16x16x32i8
-      {{16, 16, MfmaTypeId::I8TyId, 3},
-       {16, 16, 32, 8, ROCDL::mfma_i32_16x16x32_i8::getOperationName()}},
-      // mfma_i32_4x4x4i8
-      {{4, 4, MfmaTypeId::I8TyId, 1},
-       {4, 4, 64, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{4, 4, MfmaTypeId::I8TyId, 2},
-       {4, 4, 64, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{4, 4, MfmaTypeId::I8TyId, 3},
-       {4, 4, 64, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{4, 64, MfmaTypeId::I8TyId, 1},
-       {4, 64, 4, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{4, 64, MfmaTypeId::I8TyId, 2},
-       {4, 64, 4, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{4, 64, MfmaTypeId::I8TyId, 3},
-       {4, 64, 4, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{64, 4, MfmaTypeId::I8TyId, 1},
-       {64, 4, 4, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{64, 4, MfmaTypeId::I8TyId, 2},
-       {64, 4, 4, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      {{64, 4, MfmaTypeId::I8TyId, 3},
-       {64, 4, 4, 4, ROCDL::mfma_i32_4x4x4i8::getOperationName()}},
-      // fp8 * pf8
-      // mfma_f32_32x32x16_FP8_FP8
-      {{32, 32, MfmaTypeId::Fp8Fp8TyId, 3},
-       {32, 32, 16, 8, ROCDL::mfma_f32_32x32x16_fp8_fp8::getOperationName()}},
-      // mfma_f32_16x16x32_FP8_FP8
-      {{16, 16, MfmaTypeId::Fp8Fp8TyId, 3},
-       {16, 16, 32, 8, ROCDL::mfma_f32_16x16x32_fp8_fp8::getOperationName()}},
-      // mfma_f32_32x32x16_FP8_BF8
-      {{32, 32, MfmaTypeId::Fp8Bf8TyId, 3},
-       {32, 32, 16, 8, ROCDL::mfma_f32_32x32x16_fp8_bf8::getOperationName()}},
-      // mfma_f32_16x16x32_FP8_BF8
-      {{16, 16, MfmaTypeId::Fp8Bf8TyId, 3},
-       {16, 16, 32, 8, ROCDL::mfma_f32_16x16x32_fp8_bf8::getOperationName()}},
-      // mfma_f32_32x32x16_BF8_FP8
-      {{32, 32, MfmaTypeId::Bf8Fp8TyId, 3},
-       {32, 32, 16, 8, ROCDL::mfma_f32_32x32x16_bf8_fp8::getOperationName()}},
-      // mfma_f32_16x16x32_BF8_FP8
-      {{16, 16, MfmaTypeId::Bf8Fp8TyId, 3},
-       {16, 16, 32, 8, ROCDL::mfma_f32_16x16x32_bf8_fp8::getOperationName()}},
-      // mfma_f32_32x32x16_BF8_BF8
-      {{32, 32, MfmaTypeId::Bf8Bf8TyId, 3},
-       {32, 32, 16, 8, ROCDL::mfma_f32_32x32x16_bf8_bf8::getOperationName()}},
-      // mfma_f32_16x16x32_BF8_BF8
-      {{16, 16, MfmaTypeId::Bf8Bf8TyId, 3},
-       {16, 16, 32, 8, ROCDL::mfma_f32_16x16x32_bf8_bf8::getOperationName()}}};
-  return MfmaInsnMap;
-};
-
-FailureOr<MfmaInsn> MfmaInsn::selectMfma(unsigned mDim, unsigned nDim,
-                                         Type elementTypeA, Type elementTypeB,
-                                         int mfmaVersion) {
-  auto mfmaInsnAttrMap = getMfmaInsnGroupAttrMap();
-  MfmaInsnGroupSelectKey key = {
-      mDim, nDim, convertTypesToId(elementTypeA, elementTypeB), mfmaVersion};
-  auto it = mfmaInsnAttrMap.find(key);
-  if (it == mfmaInsnAttrMap.end())
-    return failure();
-  return MfmaInsn(elementTypeA, elementTypeB, (*it).second);
-}
-
-MfmaInsn::MfmaInsn(Type elementTypeA, Type elementTypeB,
-                   const MfmaInsnAttr &attr)
-    : elementTypeA(elementTypeA), elementTypeB(elementTypeB), attr(attr) {}
-
-unsigned MfmaInsn::getKDim() { return attr.k; }
-unsigned MfmaInsn::getMDim() { return attr.m; }
-unsigned MfmaInsn::getNDim() { return attr.n; }
-StringRef MfmaInsn::getInsnName() { return attr.insn; }
-unsigned  MfmaInsn::getKBase() { return attr.k_base;}
 
 } // namespace mlir

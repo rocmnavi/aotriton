@@ -1,7 +1,8 @@
-#include "triton/Conversion/TritonGPUToLLVM/PTXAsmFormat.h"
+#include "nvidia/include/TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/Support/Signals.h"
 
 #include <gtest/gtest.h>
 
@@ -145,3 +146,9 @@ TEST_F(PTXAsmFormatTest, onlyAttachMLIRArgs) {
 
 } // namespace triton
 } // namespace mlir
+
+int main(int argc, char *argv[]) {
+  llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

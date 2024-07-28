@@ -1,5 +1,5 @@
-#include "../ConvertLayoutOpToLLVM.h"
-#include "../Utility.h"
+#include "mlir/Support/LLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 using ValueTable = std::map<std::pair<int, int>, Value>;
 using ::mlir::LLVM::delinearize;
@@ -58,7 +58,7 @@ int getSizePerThreadForMN(BlockedEncodingAttr layout, bool isM) {
 
 Value getStructFromValueTable(ArrayRef<Value> vals,
                               ConversionPatternRewriter &rewriter, Location loc,
-                              TritonGPUToLLVMTypeConverter *typeConverter,
+                              const LLVMTypeConverter *typeConverter,
                               Type elemTy) {
   SmallVector<Type> elemTypes(vals.size(), elemTy);
   SmallVector<Value> elems;
@@ -68,17 +68,17 @@ Value getStructFromValueTable(ArrayRef<Value> vals,
   }
   MLIRContext *ctx = elemTy.getContext();
   Type structTy = struct_ty(elemTypes);
-  return typeConverter->packLLElements(loc, elems, rewriter, structTy);
+  return packLLElements(loc, typeConverter, elems, rewriter, structTy);
 }
 
 ValueTable getValueTableFromStruct(Value val, int K, int n0, int shapePerCTA,
                                    int sizePerThread,
                                    ConversionPatternRewriter &rewriter,
                                    Location loc,
-                                   TritonGPUToLLVMTypeConverter *typeConverter,
+                                   const LLVMTypeConverter *typeConverter,
                                    Type type) {
   ValueTable res;
-  auto elems = typeConverter->unpackLLElements(loc, val, rewriter, type);
+  auto elems = unpackLLElements(loc, val, rewriter);
   int index = 0;
   for (unsigned k = 0; k < K; ++k) {
     for (unsigned m = 0; m < n0; m += shapePerCTA)
@@ -90,10 +90,10 @@ ValueTable getValueTableFromStruct(Value val, int K, int n0, int shapePerCTA,
 }
 
 Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
-               Location loc, TritonGPUToLLVMTypeConverter *typeConverter,
+               Location loc, const LLVMTypeConverter *typeConverter,
                ConversionPatternRewriter &rewriter) {
-  auto aTensorTy = A.getType().cast<RankedTensorType>();
-  auto aLayout = aTensorTy.getEncoding().cast<SharedEncodingAttr>();
+  auto aTensorTy = cast<MemDescType>(A.getType());
+  auto aLayout = cast<SharedEncodingAttr>(aTensorTy.getEncoding());
   auto aShapePerCTA = getShapePerCTA(aTensorTy);
 
   auto aOrder = aLayout.getOrder();
@@ -101,7 +101,9 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
 
   bool isARow = aOrder[0] == 1;
 
-  auto aSmem = getSharedMemoryObjectFromStruct(loc, llA, rewriter);
+  auto aSmem = getSharedMemoryObjectFromStruct(
+      loc, llA, typeConverter->convertType(aTensorTy.getElementType()),
+      rewriter);
   Value strideAM = aSmem.strides[0];
   Value strideAK = aSmem.strides[1];
   Value strideA0 = isARow ? strideAK : strideAM;
@@ -128,13 +130,12 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
   for (int i = 0; i < aNumPtr; ++i) {
     aOff[i] = add(mul(offA0, strideA0), mul(offA1, strideA1));
   }
-  auto elemTy = typeConverter->convertType(
-      A.getType().cast<RankedTensorType>().getElementType());
+  auto elemTy = typeConverter->convertType(aTensorTy.getElementType());
 
-  Type ptrTy = ptr_ty(elemTy, 3);
+  Type ptrTy = ptr_ty(rewriter.getContext(), 3);
   SmallVector<Value> aPtrs(aNumPtr);
   for (int i = 0; i < aNumPtr; ++i)
-    aPtrs[i] = gep(ptrTy, aSmem.base, aOff[i]);
+    aPtrs[i] = gep(ptrTy, elemTy, aSmem.base, aOff[i]);
 
   SmallVector<Value> vas;
 
@@ -146,8 +147,8 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
       for (unsigned mm = 0; mm < mSizePerThread; ++mm) {
         Value offset =
             add(mul(i32_val(m + mm), strideAM), mul(i32_val(k), strideAK));
-        Value pa = gep(ptrTy, aPtrs[0], offset);
-        Value va = load(pa);
+        Value pa = gep(ptrTy, elemTy, aPtrs[0], offset);
+        Value va = load(elemTy, pa);
         vas.emplace_back(va);
       }
 
@@ -155,10 +156,10 @@ Value loadAFMA(Value A, Value llA, BlockedEncodingAttr dLayout, Value thread,
 }
 
 Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
-               Location loc, TritonGPUToLLVMTypeConverter *typeConverter,
+               Location loc, const LLVMTypeConverter *typeConverter,
                ConversionPatternRewriter &rewriter) {
-  auto bTensorTy = B.getType().cast<RankedTensorType>();
-  auto bLayout = bTensorTy.getEncoding().cast<SharedEncodingAttr>();
+  auto bTensorTy = cast<MemDescType>(B.getType());
+  auto bLayout = cast<SharedEncodingAttr>(bTensorTy.getEncoding());
   auto bShapePerCTA = getShapePerCTA(bTensorTy);
 
   auto bOrder = bLayout.getOrder();
@@ -166,7 +167,9 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
 
   bool isBRow = bOrder[0] == 1;
 
-  auto bSmem = getSharedMemoryObjectFromStruct(loc, llB, rewriter);
+  auto bSmem = getSharedMemoryObjectFromStruct(
+      loc, llB, typeConverter->convertType(bTensorTy.getElementType()),
+      rewriter);
   Value strideBN = bSmem.strides[1];
   Value strideBK = bSmem.strides[0];
   Value strideB0 = isBRow ? strideBN : strideBK;
@@ -193,13 +196,12 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
   for (int i = 0; i < bNumPtr; ++i) {
     bOff[i] = add(mul(offB0, strideB0), mul(offB1, strideB1));
   }
-  auto elemTy = typeConverter->convertType(
-      B.getType().cast<RankedTensorType>().getElementType());
+  auto elemTy = typeConverter->convertType(bTensorTy.getElementType());
 
-  Type ptrTy = ptr_ty(elemTy, 3);
+  Type ptrTy = ptr_ty(rewriter.getContext(), 3);
   SmallVector<Value> bPtrs(bNumPtr);
   for (int i = 0; i < bNumPtr; ++i)
-    bPtrs[i] = gep(ptrTy, bSmem.base, bOff[i]);
+    bPtrs[i] = gep(ptrTy, elemTy, bSmem.base, bOff[i]);
 
   SmallVector<Value> vbs;
 
@@ -211,8 +213,8 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
       for (unsigned nn = 0; nn < nSizePerThread; ++nn) {
         Value offset =
             add(mul(i32_val(n + nn), strideBN), mul(i32_val(k), strideBK));
-        Value pb = gep(ptrTy, bPtrs[0], offset);
-        Value vb = load(pb);
+        Value pb = gep(ptrTy, elemTy, bPtrs[0], offset);
+        Value vb = load(elemTy, pb);
         vbs.emplace_back(vb);
       }
 
@@ -222,7 +224,7 @@ Value loadBFMA(Value B, Value llB, BlockedEncodingAttr dLayout, Value thread,
 namespace SharedToDotOperandFMA {
 Value convertLayout(int opIdx, Value val, Value llVal,
                     BlockedEncodingAttr dLayout, Value thread, Location loc,
-                    TritonGPUToLLVMTypeConverter *typeConverter,
+                    const LLVMTypeConverter *typeConverter,
                     ConversionPatternRewriter &rewriter) {
   if (opIdx == 0)
     return loadAFMA(val, llVal, dLayout, thread, loc, typeConverter, rewriter);

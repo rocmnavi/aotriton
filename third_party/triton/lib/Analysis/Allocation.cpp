@@ -1,16 +1,20 @@
 #include "triton/Analysis/Allocation.h"
-#include "mlir/Analysis/DataFlowFramework.h"
-#include "mlir/Analysis/Liveness.h"
-#include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "triton/Analysis/Alias.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
 #include <limits>
 #include <numeric>
 
+#include "mlir/Analysis/DataFlowFramework.h"
+#include "mlir/Analysis/Liveness.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Support/LLVM.h"
+#include "triton/Analysis/Alias.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/SmallVector.h"
+
+using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
 using ::mlir::triton::gpu::BlockedEncodingAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
 using ::mlir::triton::gpu::getContigPerThread;
@@ -18,9 +22,8 @@ using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::getShapePerCTATile;
 using ::mlir::triton::gpu::getSizePerThread;
-using ::mlir::triton::gpu::MfmaEncodingAttr;
 using ::mlir::triton::gpu::getUniqueContigPerThread;
-using ::mlir::triton::gpu::MmaEncodingAttr;
+using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 using ::mlir::triton::gpu::SliceEncodingAttr;
 
@@ -36,12 +39,14 @@ constexpr int kPtrBitWidth = 64;
 
 static std::pair<SmallVector<unsigned>, SmallVector<unsigned>>
 getCvtOrder(Attribute srcLayout, Attribute dstLayout) {
-  auto srcMmaLayout = srcLayout.dyn_cast<MmaEncodingAttr>();
-  auto srcDotLayout = srcLayout.dyn_cast<DotOperandEncodingAttr>();
-  auto dstMmaLayout = dstLayout.dyn_cast<MmaEncodingAttr>();
-  auto dstDotLayout = dstLayout.dyn_cast<DotOperandEncodingAttr>();
-  assert(!(srcMmaLayout && dstMmaLayout) &&
-         "Unexpected mma -> mma layout conversion");
+  auto srcMmaLayout = mlir::dyn_cast<NvidiaMmaEncodingAttr>(srcLayout);
+  auto srcDotLayout = mlir::dyn_cast<DotOperandEncodingAttr>(srcLayout);
+  auto dstMmaLayout = mlir::dyn_cast<NvidiaMmaEncodingAttr>(dstLayout);
+  auto dstDotLayout = mlir::dyn_cast<DotOperandEncodingAttr>(dstLayout);
+
+  assert(!(srcMmaLayout && dstMmaLayout && !srcMmaLayout.isAmpere()) &&
+         "mma -> mma layout conversion is only supported on Ampere");
+
   // mma or dot layout does not have an order, so the order depends on the
   // layout of the other operand.
   auto inOrd = (srcMmaLayout || srcDotLayout) ? getOrder(dstLayout)
@@ -53,36 +58,19 @@ getCvtOrder(Attribute srcLayout, Attribute dstLayout) {
 }
 
 SmallVector<unsigned> getRepShapeForCvtLayout(triton::gpu::ConvertLayoutOp op) {
-  auto srcTy = op.getSrc().getType().cast<RankedTensorType>();
-  auto dstTy = op.getResult().getType().cast<RankedTensorType>();
+  auto srcTy = op.getSrc().getType();
+  auto dstTy = op.getType();
   Attribute srcLayout = srcTy.getEncoding();
   Attribute dstLayout = dstTy.getEncoding();
+
+  if (!cvtNeedsSharedMemory(srcTy, dstTy)) {
+    return {};
+  }
 
   if (shouldUseDistSmem(srcLayout, dstLayout)) {
     // TODO: padding to avoid bank conflicts
     return convertType<unsigned, int64_t>(getShapePerCTA(srcTy));
   }
-
-  // MmaToDotShortcut and MmaToMmaShortcut doesn't use shared mem
-  if (auto srcMmaLayout = srcLayout.dyn_cast<MmaEncodingAttr>()) {
-    if (dstLayout.isa<DotOperandEncodingAttr>()) {
-      if (isMmaToDotShortcut(srcTy, dstTy)) {
-        return {};
-      }
-    } else if (auto dstMmaLayout = dstLayout.dyn_cast<MmaEncodingAttr>()) {
-      if (isMmaToMmaShortcut(srcTy, dstTy)) {
-        return {};
-      }
-    }
-  }
-
-#ifdef USE_ROCM
-  if (srcLayout.isa<MfmaEncodingAttr>() &&
-      srcLayout.dyn_cast<MfmaEncodingAttr>().getIsTransposed() &&
-      dstLayout.isa<DotOperandEncodingAttr>())
-    if (isMfmaToDotShortcut(srcTy, dstTy))
-      return {};
-#endif
 
   assert(srcLayout && dstLayout && "Unexpected layout in getRepShape()");
 
@@ -107,11 +95,13 @@ getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
   auto repShape = getRepShapeForCvtLayout(op);
   if (repShape.empty())
     return repShape;
-
-  auto srcTy = op.getSrc().getType().cast<RankedTensorType>();
-  auto dstTy = op.getResult().getType().cast<RankedTensorType>();
+  auto rank = repShape.size();
+  auto srcTy = op.getSrc().getType();
+  auto dstTy = op.getType();
   Attribute srcLayout = srcTy.getEncoding();
   Attribute dstLayout = dstTy.getEncoding();
+
+  assert(!isMfmaToDotShortcut(srcTy, dstTy));
 
   auto [inOrd, outOrd] = getCvtOrder(srcLayout, dstLayout);
   unsigned srcContigPerThread =
@@ -120,13 +110,30 @@ getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
       getUniqueContigPerThread(dstLayout, dstTy.getShape())[outOrd[0]];
   // TODO: Fix the legacy issue that ourOrd[0] == 0 always means
   //       that we cannot do vectorization.
-  inVec = outOrd[0] == 0 ? 1 : inOrd[0] == 0 ? 1 : srcContigPerThread;
-  outVec = outOrd[0] == 0 ? 1 : dstContigPerThread;
+  unsigned innerDim = rank - 1;
+  inVec = outOrd[0] != innerDim  ? 1
+          : inOrd[0] != innerDim ? 1
+                                 : srcContigPerThread;
+  outVec = outOrd[0] != innerDim ? 1 : dstContigPerThread;
 
-  if (repShape.size() <= 1)
+  // For conversions to MmaV1 (Nvidia V100), this inVec is hardcoded in the
+  // codegen.
+  if (auto mma = mlir::dyn_cast<NvidiaMmaEncodingAttr>(srcLayout)) {
+    if (mma.getVersionMajor() == 1) {
+      inVec = srcContigPerThread;
+    } else if (mlir::isa<BlockedEncodingAttr>(dstLayout)) {
+      // when storing from mma layout and loading in blocked layout vectorizing
+      // the load back gives better performance even if there is a
+      // transposition.
+      outVec = dstContigPerThread;
+    }
+  }
+
+  if (rank <= 1)
     return repShape;
-  unsigned paddedDim = 1;
-  if (auto dstBlockedLayout = dstLayout.dyn_cast<BlockedEncodingAttr>()) {
+  // pad the last dimension
+  unsigned paddedDim = rank - 1;
+  if (auto dstBlockedLayout = mlir::dyn_cast<BlockedEncodingAttr>(dstLayout)) {
     paddedDim = dstBlockedLayout.getOrder()[0];
   }
   unsigned pad = std::max(inVec, outVec);
@@ -134,16 +141,10 @@ getScratchConfigForCvtLayout(triton::gpu::ConvertLayoutOp op, unsigned &inVec,
   return repShape;
 }
 
-SmallVector<unsigned>
-getScratchConfigForStoreAsync(triton::nvidia_gpu::StoreAsyncOp op) {
-  auto srcTy = op.getSrc().getType().cast<RankedTensorType>();
-  return convertType<unsigned, int64_t>(getShapePerCTA(srcTy));
-}
-
 // TODO: extend beyond scalars
 SmallVector<unsigned> getScratchConfigForAtomicRMW(triton::AtomicRMWOp op) {
   SmallVector<unsigned> smemShape;
-  if (op.getPtr().getType().isa<RankedTensorType>()) {
+  if (isa<RankedTensorType>(op.getPtr().getType())) {
     // do nothing or just assert because shared memory is not used in tensor up
     // to now
   } else {
@@ -172,67 +173,10 @@ private:
   using BufferT = Allocation::BufferT;
 
   /// Value -> Liveness Range
-  using IntervalT = Interval<size_t>;
   /// Use MapVector to ensure determinism.
-  using BufferRangeMapT = llvm::MapVector<BufferT *, IntervalT>;
+  using BufferRangeMapT = llvm::MapVector<BufferT *, Interval<size_t>>;
   /// Nodes -> Nodes
   using GraphT = DenseMap<BufferT *, DenseSet<BufferT *>>;
-
-  /// Set of Liveness Intervals
-  class LivenessR : public SmallVector<IntervalT, 4> {
-  public:
-    LivenessR() = default;
-    LivenessR(const LivenessR &) = default;
-
-    /// Disjointness
-    bool isDisjoint() const {
-      if (size() < 2)
-        return false;
-      // sorted so the first OOB proves disjoint
-      auto maxId = (*this)[0].end();
-      for (auto rng : *this) {
-        if (rng.start() <= maxId) {
-          // adjoining
-          maxId = std::max(maxId, rng.end());
-        } else
-          return true;
-      }
-      return false;
-    }
-
-    void sort() {
-      llvm::sort(*this, [](const auto &lhs, const auto &rhs) {
-                          return lhs.start() <= rhs.start();
-                        });
-    }
-
-    bool addAdjacent(size_t id) {
-      bool isAdjacent = false;
-      for (auto &interval : *this) {
-        if (interval.adjacent(id)) {
-          isAdjacent = true;
-          interval = interval.merge(IntervalT(id));
-        }
-      }
-      return isAdjacent;
-    }
-
-    void add(size_t id) {
-      if (!addAdjacent(id))
-        push_back(IntervalT(id));
-    }
-    IntervalT unionize() const {
-      IntervalT res;
-      if (size()) {
-        res = front();
-        for (auto &I : *this)
-          res = res.merge(I);
-      }
-      return res;
-    }
-  };
-  
-  typedef function_ref<LivenessR(Value value)> LivenessF;
 
   void run() {
     getValuesAndSizes();
@@ -247,19 +191,20 @@ private:
     // For example: %a = scf.if -> yield
     // %a must be allocated elsewhere by other operations.
     // FIXME(Keren): extract and insert are always alias for now
-    if (!maybeSharedAllocationOp(op) || maybeAliasOp(op))
+    if (!maybeSharedAllocationOp(op))
       return;
 
     // XXX(Keren): Why this hard-coded alignment?
     size_t kAlignment = 8;
     for (Value result : op->getResults()) {
-      if (triton::gpu::isSharedEncoding(result)) {
+      auto alloc = result.getDefiningOp<triton::gpu::LocalAllocOp>();
+      if (alloc && alloc.isSharedMemoryAlloc()) {
         // Bytes could be a different value once we support padding or other
         // allocation policies.
-        auto tensorType = result.getType().dyn_cast<RankedTensorType>();
-        auto shapePerCTA = triton::gpu::getShapePerCTA(tensorType);
+        auto allocType = alloc.getType();
+        auto shapePerCTA = triton::gpu::getShapePerCTA(allocType);
         auto bytes = product<int64_t>(shapePerCTA) *
-                     tensorType.getElementTypeBitWidth() / 8;
+                     allocType.getElementTypeBitWidth() / 8;
 
         // XXX(Keren): magic numbers 256 and 1024
         // benzh@maybe alignment should be passed in.
@@ -271,13 +216,6 @@ private:
         allocation->addBuffer<BufferT::BufferKind::Explicit>(result, bytes,
                                                              kAlignment);
       }
-    }
-    if (isa<triton::nvidia_gpu::AllocMBarrierOp>(op)) {
-      Value result = op->getResult(0);
-      if (!result.getType().isa<RankedTensorType>())
-        // In case AllocMBarrierOp is allocating scalar mbarriers
-        allocation->addBuffer<BufferT::BufferKind::Explicit>(result, 8,
-                                                             kAlignment);
     }
   }
 
@@ -307,13 +245,21 @@ private:
       unsigned bytes = helper.getScratchSizeInBytes();
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,
                                                           scratchAlignment);
+    } else if (auto histogram = dyn_cast<triton::HistogramOp>(op)) {
+      auto dstTy = histogram.getType();
+      int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(
+          op->getParentOfType<ModuleOp>());
+      auto bytes = std::max<int>(dstTy.getNumElements(), threadsPerWarp) *
+                   std::max<int>(8, dstTy.getElementTypeBitWidth()) / 8;
+      maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,
+                                                          scratchAlignment);
     } else if (auto cvtLayout = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
-      auto srcTy = cvtLayout.getSrc().getType().cast<RankedTensorType>();
-      auto dstTy = cvtLayout.getResult().getType().cast<RankedTensorType>();
+      auto srcTy = cvtLayout.getSrc().getType();
+      auto dstTy = cvtLayout.getType();
       auto srcEncoding = srcTy.getEncoding();
       auto dstEncoding = dstTy.getEncoding();
-      if (srcEncoding.isa<SharedEncodingAttr>() ||
-          dstEncoding.isa<SharedEncodingAttr>()) {
+      if (mlir::isa<SharedEncodingAttr>(srcEncoding) ||
+          mlir::isa<SharedEncodingAttr>(dstEncoding)) {
         // Conversions from/to shared memory do not need scratch memory.
         return;
       }
@@ -324,40 +270,26 @@ private:
       unsigned inVec = 0;
       unsigned outVec = 0;
       auto smemShape = getScratchConfigForCvtLayout(cvtLayout, inVec, outVec);
-      unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                       std::multiplies{});
+      auto elems = getNumElements<unsigned>(smemShape);
       auto bytes =
-          srcTy.getElementType().isa<triton::PointerType>()
+          isa<triton::PointerType>(srcTy.getElementType())
               ? elems * kPtrBitWidth / 8
               : elems * std::max<int>(8, srcTy.getElementTypeBitWidth()) / 8;
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,
                                                           scratchAlignment);
-    } else if (auto storeAsyncOp =
-                   dyn_cast<triton::nvidia_gpu::StoreAsyncOp>(op)) {
-      auto srcTy = storeAsyncOp.getSrc().getType().cast<RankedTensorType>();
-      auto srcEncoding = srcTy.getEncoding();
-      if (!srcEncoding.isa<MmaEncodingAttr>()) {
-        return;
-      }
-      auto smemShape = getScratchConfigForStoreAsync(storeAsyncOp);
-      unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                       std::multiplies{});
-      auto bytes = elems * std::max<int>(8, srcTy.getElementTypeBitWidth()) / 8;
-      maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes, 1024);
     } else if (auto atomicRMWOp = dyn_cast<triton::AtomicRMWOp>(op)) {
       auto value = op->getOperand(0);
       // only scalar requires scratch memory
       // make it explicit for readability
-      if (value.getType().dyn_cast<RankedTensorType>()) {
+      if (dyn_cast<RankedTensorType>(value.getType())) {
         // nothing to do
       } else {
         auto smemShape = getScratchConfigForAtomicRMW(atomicRMWOp);
-        unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                         std::multiplies{});
+        auto elems = getNumElements<unsigned>(smemShape);
         auto elemTy =
-            value.getType().cast<triton::PointerType>().getPointeeType();
+            cast<triton::PointerType>(value.getType()).getPointeeType();
         auto bytes =
-            elemTy.isa<triton::PointerType>()
+            isa<triton::PointerType>(elemTy)
                 ? elems * kPtrBitWidth / 8
                 : elems * std::max<int>(8, elemTy.getIntOrFloatBitWidth()) / 8;
         maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,
@@ -367,15 +299,14 @@ private:
       // only scalar requires scratch memory
       // make it explicit for readability
       auto value = op->getOperand(0);
-      if (value.getType().dyn_cast<RankedTensorType>()) {
+      if (dyn_cast<RankedTensorType>(value.getType())) {
         // nothing to do
       } else {
         auto smemShape = getScratchConfigForAtomicCAS(atomicCASOp);
-        unsigned elems = std::accumulate(smemShape.begin(), smemShape.end(), 1,
-                                         std::multiplies{});
+        auto elems = getNumElements<unsigned>(smemShape);
         auto elemTy =
-            value.getType().cast<triton::PointerType>().getPointeeType();
-        auto bytes = elemTy.isa<triton::PointerType>()
+            cast<triton::PointerType>(value.getType()).getPointeeType();
+        auto bytes = isa<triton::PointerType>(elemTy)
                          ? elems * kPtrBitWidth / 8
                          : elems * elemTy.getIntOrFloatBitWidth() / 8;
         maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, bytes,
@@ -431,55 +362,33 @@ private:
 
   /// Computes the liveness range of the allocated value.
   /// Each buffer is allocated only once.
-  void resolveExplicitBufferLiveness(LivenessF getLiveness) {
+  void resolveExplicitBufferLiveness(
+      function_ref<Interval<size_t>(Value value)> getLiveness) {
     for (auto valueBufferIter : allocation->valueBuffer) {
       auto value = valueBufferIter.first;
       auto *buffer = valueBufferIter.second;
-      auto ranges = getLiveness(value);
-      bufferRange[buffer] = ranges.unionize();
+      bufferRange[buffer] = getLiveness(value);
     }
   }
 
   /// Extends the liveness range by unionizing the liveness range of the aliased
   /// values because each allocated buffer could be an alias of others, if block
   /// arguments are involved.
-  /// Only unionize adjacent live ranges to account for loop-carried buffers that
-  /// are mutually exclusive.
-  /// Example from stream pipeliner:
-  ///  3    %b0 = convert_layout %g0                  -+
-  ///  4    %fr = for (.., %arg0 = %b0) {              |
-  ///  5        %gn = load %pc                         |
-  ///  6        %bc = convert_layout %arg0            -+
-  ///  7        %v = add %bc, ...
-  ///  8        %bn = convert_layout %gn              -+
-  ///  9        %pn = addptr %pc, %cst                 |
-  ///  10   }                                          |
-  ///  11   %be = convert_layout %fr#1                -+
-  ///  12   %ve = add %be
-  void resolveAliasBufferLiveness(LivenessF getLiveness) {
+  void resolveAliasBufferLiveness(
+      function_ref<Interval<size_t>(Value value)> getLiveness) {
     for (auto aliasBufferIter : allocation->aliasBuffer) {
       auto value = aliasBufferIter.first;
       auto buffers = aliasBufferIter.second;
-      auto aranges = getLiveness(value);
-      bool disjoint = aranges.isDisjoint();
+      auto range = getLiveness(value);
       for (auto *buffer : buffers) {
-        auto range = aranges[0];
+        auto minId = range.start();
+        auto maxId = range.end();
         if (bufferRange.count(buffer)) {
-          auto brange = bufferRange[buffer];
-          if (disjoint) {
-            // find adjacent/intersecting
-            for (auto arange : aranges) {
-              if (arange.adjacent(brange) ||
-                  arange.intersects(brange))
-                brange = arange.merge(brange);
-            }
-            range = brange;
-          } else {
-            // Extend the allocated buffer's range
-            range = range.merge(brange);
-          }
+          // Extend the allocated buffer's range
+          minId = std::min(minId, bufferRange[buffer].start());
+          maxId = std::max(maxId, bufferRange[buffer].end());
         }
-        bufferRange[buffer] = range;
+        bufferRange[buffer] = Interval(minId, maxId);
       }
     }
   }
@@ -489,7 +398,7 @@ private:
   /// allocated, but is used to store intermediate results.
   void resolveScratchBufferLiveness(
       const DenseMap<Operation *, size_t> &operationId) {
-    // Analyze liveness of scratch buffers and vritual buffers.
+    // Analyze liveness of scratch buffers and virtual buffers.
     auto processScratchMemory = [&](const auto &container) {
       for (auto opScratchIter : container) {
         // Any scratch memory's live range is the current operation's live
@@ -529,22 +438,19 @@ private:
     // Analyze liveness of explicit buffers
     Liveness liveness(operation);
     auto getValueLivenessRange = [&](Value value) {
-      LivenessR ranges;
-      // Shared memory allocated by mbarrier cannot be reused
-      if (value.getDefiningOp() &&
-          isa<triton::nvidia_gpu::AllocMBarrierOp>(value.getDefiningOp())) {
-        ranges.push_back(Interval(std::numeric_limits<size_t>::min(),
-                        std::numeric_limits<size_t>::max()));
-        return ranges;
-      }
-
       auto liveOperations = liveness.resolveLiveness(value);
+      auto minId = std::numeric_limits<size_t>::max();
+      auto maxId = std::numeric_limits<size_t>::min();
       std::for_each(liveOperations.begin(), liveOperations.end(),
                     [&](Operation *liveOp) {
-                      ranges.add(operationId[liveOp]);
+                      if (operationId[liveOp] < minId) {
+                        minId = operationId[liveOp];
+                      }
+                      if ((operationId[liveOp] + 1) > maxId) {
+                        maxId = operationId[liveOp] + 1;
+                      }
                     });
-      ranges.sort();
-      return ranges;
+      return Interval(minId, maxId);
     };
 
     resolveExplicitBufferLiveness(getValueLivenessRange);
@@ -554,15 +460,14 @@ private:
 
   /// Computes the shared memory offsets for all related values.
   /// Paper: Algorithms for Compile-Time Memory Optimization
-  /// (https://www.cs.utexas.edu/users/harrison/papers/compile-time.pdf)
+  /// (https://dl.acm.org/doi/pdf/10.5555/314500.315082)
   void computeOffsets() {
     SmallVector<BufferT *> buffers;
     for (auto bufferIter : bufferRange) {
       buffers.emplace_back(bufferIter.first);
     }
 
-    DenseMap<BufferT *, size_t> bufferStart;
-    calculateStarts(buffers, bufferStart);
+    calculateStarts(buffers);
 
     // NOTE: The original paper doesn't consider interference between
     // the bumped ranges. Buffers that previously do not interfere with
@@ -572,16 +477,15 @@ private:
     // increase the buffer offset and keep reducing conflicts, we will
     // eventually reach a fixed point.
     GraphT interference;
-    buildInterferenceGraph(buffers, bufferStart, interference);
+    buildInterferenceGraph(buffers, interference);
     do {
-      allocate(buffers, interference, bufferStart);
-      buildInterferenceGraph(buffers, bufferStart, interference);
+      allocate(buffers, interference);
+      buildInterferenceGraph(buffers, interference);
     } while (!interference.empty());
   }
 
   /// Computes the initial shared memory offsets.
-  void calculateStarts(const SmallVector<BufferT *> &buffers,
-                       DenseMap<BufferT *, size_t> &bufferStart) {
+  void calculateStarts(const SmallVector<BufferT *> &buffers) {
     //  v = values in shared memory
     //  t = triplet of (size, start, end)
     //  shared memory space
@@ -599,13 +503,13 @@ private:
     // If the available triple's range is less than a given buffer range,
     // we won't know if there has been an overlap without using graph coloring.
     // Start -> Liveness Range
-    using TripleMapT = std::multimap<size_t, IntervalT>;
+    using TripleMapT = std::multimap<size_t, Interval<size_t>>;
     TripleMapT tripleMap;
-    tripleMap.insert(std::make_pair(0, IntervalT()));
+    tripleMap.insert(std::make_pair(0, Interval<size_t>()));
     SmallVector<BufferT *> xBuffers = buffers;
     while (!xBuffers.empty()) {
       auto tripleIt = tripleMap.begin();
-      auto size = tripleIt->first;
+      auto offset = tripleIt->first;
       auto range = tripleIt->second;
       tripleMap.erase(tripleIt);
       auto bufferIt =
@@ -623,10 +527,8 @@ private:
         auto xRange = bufferRange.lookup(buffer);
         // TODO(Keren): A buffer's size shouldn't be determined here, have to
         // clean it up
-        size_t alignment = buffer->alignment;
-        size_t alignSize = ((size + alignment - 1) / alignment) * alignment;
-        bufferStart[buffer] = alignSize;
-        tripleMap.insert({alignSize + xSize,
+        size_t alignOffset = buffer->setOffsetAligned(offset);
+        tripleMap.insert({alignOffset + xSize,
                           Interval{std::max(range.start(), xRange.start()),
                                    std::min(range.end(), xRange.end())}});
         // We could either insert (range.start, xRange.start) or (range.start,
@@ -634,9 +536,9 @@ private:
         // offset, and the graph coloring algorithm will solve the interference,
         // if any
         if (range.start() < xRange.start())
-          tripleMap.insert({size, Interval{range.start(), xRange.end()}});
+          tripleMap.insert({offset, Interval{range.start(), xRange.end()}});
         if (xRange.end() < range.end())
-          tripleMap.insert({size, Interval{xRange.start(), range.end()}});
+          tripleMap.insert({offset, Interval{xRange.start(), range.end()}});
         xBuffers.erase(bufferIt);
       }
     }
@@ -645,7 +547,6 @@ private:
   /// Builds a graph of all shared memory values. Edges are created between
   /// shared memory values that are overlapping.
   void buildInterferenceGraph(const SmallVector<BufferT *> &buffers,
-                              const DenseMap<BufferT *, size_t> &bufferStart,
                               GraphT &interference) {
     // Reset interference graph
     interference.clear();
@@ -653,8 +554,8 @@ private:
       for (auto y : buffers) {
         if (x == y)
           continue;
-        auto xStart = bufferStart.lookup(x);
-        auto yStart = bufferStart.lookup(y);
+        auto xStart = x->offset;
+        auto yStart = y->offset;
         auto xSize = x->size;
         auto ySize = y->size;
         Interval xSizeRange = {xStart, xStart + xSize};
@@ -671,8 +572,7 @@ private:
 
   /// Finalizes shared memory offsets considering interference.
   void allocate(const SmallVector<BufferT *> &buffers,
-                const GraphT &interference,
-                DenseMap<BufferT *, size_t> &bufferStart) {
+                const GraphT &interference) {
     // Reset shared memory size
     allocation->sharedMemorySize = 0;
     // First-fit graph coloring
@@ -703,27 +603,14 @@ private:
     // TODO(Keren): We are wasting memory here.
     // Nodes with color2 can actually start with 24.
     for (auto x : buffers) {
-      size_t adj = 0;
+      size_t newOffset = 0;
       for (auto y : interference.lookup(x)) {
-        adj = std::max(adj, bufferStart.lookup(y) + y->size);
+        newOffset = std::max(newOffset, y->offset + y->size);
       }
-      x->offset = bufferStart.lookup(x) + colors.lookup(x) * adj;
-      bufferStart[x] = x->offset;
+      if (colors.lookup(x) != 0)
+        x->setOffsetAligned(newOffset);
       allocation->sharedMemorySize =
           std::max(allocation->sharedMemorySize, x->offset + x->size);
-    }
-  }
-
-  void dump() const {
-    llvm::outs() << "DUMP: " << "\n";
-    for (auto bufferIter : bufferRange) {
-      
-      llvm::outs() << "ID= " << bufferIter.first->id << "\n";
-      // llvm::outs() << "             Kind= " << kind << "\n";
-      llvm::outs() << "     Size= " << bufferIter.first->size << "\n";
-      llvm::outs() << "     Offs= " << bufferIter.first->offset << "\n";
-      llvm::outs() << "  -> " << bufferIter.second.start() << "\n";
-      llvm::outs() << "  -> " << bufferIter.second.end() << "\n";
     }
   }
 

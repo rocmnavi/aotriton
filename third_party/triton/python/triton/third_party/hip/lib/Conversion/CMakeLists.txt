@@ -1,2 +1,0 @@
-add_subdirectory(TritonToTritonGPUROCM)
-add_subdirectory(TritonGPUROCMToLLVM)

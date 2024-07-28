@@ -23,14 +23,14 @@ def ConvertTritonToTritonGPU: Pass<"convert-triton-to-tritongpu", "mlir::ModuleO
               "number of warps">,
 
        Option<"threadsPerWarp", "threads-per-warp",
-              "int32_t", /*default*/"TRITONGPU_DEFAULT_WARPSIZE",
+              "int32_t", /*default*/"32",
               "number of threads per warp">,
         Option<"numCTAs", "num-ctas",
               "int32_t", /*default*/"1",
               "number of ctas in a cga">,
-        Option<"computeCapability", "compute-capability",
-              "int32_t", /*default*/"80",
-              "compute capability">
+        Option<"target", "target",
+              "std::string", /*default*/"\"\"",
+              "the GPU target, e.g., cuda:80, hip:gfx942">
    ];
 }
 

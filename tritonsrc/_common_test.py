@@ -1,6 +1,7 @@
 import os
 from typing import List, Tuple, Optional
 from collections import namedtuple
+import numpy as np
 import torch
 
 def _reference_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
@@ -100,9 +101,9 @@ class SdpaContext(object):
         q = torch.rand(*qdims, dtype=dtype, device=device)
         k = torch.rand(*kdims, dtype=dtype, device=device)
         v = torch.rand(*vdims, dtype=dtype, device=device)
-        if bias_type is None:
+        if bias_type is None or bias_type == 0:
             b = None
-        elif bias_type == 'matrix':
+        elif bias_type == 'matrix' or bias_type == 1:
             # b = torch.empty(bdims, dtype=dtype, device="cuda").normal_(mean=0., std=0.5)
             b = torch.rand(*bdims, dtype=dtype, device=device)
             b = b.expand(BATCH, N_HEADS, b.shape[0], b.shape[1])
@@ -121,12 +122,18 @@ class SdpaContext(object):
                 print(f'{b.stride()=}')
             '''
         self.dev_tensors = (q, k, v, b)
-        self.FUDGE_FACTORS = (4, 2, 2, 2)
+        # self.FUDGE_FACTORS = (4, 2, 2, 2)  # Matches the order of self.dev_tensors
         self.OUT_FUDGE_FACTOR = 3
 
     @property
     def dtype(self):
         return self.dev_tensors[0].dtype
+
+    @property
+    def seqlen_k(self):
+        q, k, v, b = self.dev_tensors
+        seqlen_k = k.shape[2]
+        return seqlen_k
 
     @property
     def ref_device(self):
@@ -142,11 +149,10 @@ class SdpaContext(object):
     def clone_tensor_tuple(in_tensors, dtype, device=None):
         return tuple([SdpaContext.clone_tensor(t, dtype=dtype, device=device) for t in in_tensors])
 
-    def create_ref_inputs(self):
+    def create_ref_inputs(self, target_gpu_device='cuda'):
         ref_device_option = os.getenv('AOTRITON_REF_DEVICE_OPTION', default='default')
         if ref_device_option == 'default':
-            q, k, v, b = self.dev_tensors
-            seqlen_k = k.shape[2]
+            seqlen_k = self.seqlen_k
             '''
             Shader _ZN2at6native12_GLOBAL__N_119cunn_SoftMaxForwardILi2EdddNS1_22SoftMaxForwardEpilogueEEEvPT2_PKT0_i causes Segfault
             for Case test_op_bwd[False-0.0-dtype2-0.0-False-587-64-8-4-4], but cannot be reproduced by running this individual UT.
@@ -155,9 +161,9 @@ class SdpaContext(object):
             if seqlen_k == 587:
                 ref_device = 'cpu'
             else:
-                ref_device = 'cuda'
+                ref_device = target_gpu_device
         elif ref_device_option == 'cuda':
-            ref_device = 'cuda'
+            ref_device = target_gpu_device
         elif ref_device_option == 'cpu':
             ref_device = 'cpu'
         else:
@@ -187,10 +193,23 @@ class SdpaContext(object):
         self._require_grads(self.ref_tensors, skip_dq=skip_dq, skip_dk_dv=skip_dk_dv, skip_db=skip_db)
         self._require_grads(self.lp_ref_tensors, skip_dq=skip_dq, skip_dk_dv=skip_dk_dv, skip_db=skip_db)
 
+    def _compute_fudge_factors(self, p : SdpaParams):
+        ref_q, ref_k, ref_v, ref_b = self.ref_tensors
+        dtype = self.dtype
+        seqlen_k = self.seqlen_k
+        seqlen_k_fudge_factor = 1.0 if seqlen_k < 1024 else 2.0
+        dropout_fudge_factor = 1.0 if p.dropout_p == 0.0 else 2.0
+        query_fudge_factor = 8 * dropout_fudge_factor * seqlen_k_fudge_factor  # TODO: Investigate why grad_q needs larger tolerances
+        key_fudge_factor = 8 * dropout_fudge_factor
+        value_fudge_factor = 7
+        bias_fudge_factor = 12
+        return (query_fudge_factor, key_fudge_factor, value_fudge_factor, bias_fudge_factor)
+
     @staticmethod
     def _compute_ref_forward(ref_tensors, p : SdpaParams):
         ref_q, ref_k, ref_v, ref_b = ref_tensors
         dropout_mask = p.dropout_mask if p.dropout_mask is None else p.dropout_mask.to(device=ref_q.device)
+        # _scaled_dot_product_attention_math seems also working for nested tensor
         ref_out, ref_mask = torch.ops.aten._scaled_dot_product_attention_math(ref_q, ref_k, ref_v,
                                                                     dropout_p=p.dropout_p,
                                                                     is_causal=p.causal,
@@ -200,6 +219,7 @@ class SdpaContext(object):
         return (ref_out, ref_mask)
 
     def compute_ref_forward(self, p : SdpaParams):
+        self.fudge_factors = self._compute_fudge_factors(p)
         self.refout_tensors = self._compute_ref_forward(self.ref_tensors, p)
         self.lp_refout_tensors = self._compute_ref_forward(self.lp_ref_tensors, p)
         return self.lp_refout_tensors
@@ -219,9 +239,9 @@ class SdpaContext(object):
 
     # Note: this follows pytorch's testing approach and expects low precision dout
     def compute_backward(self, out, dout):
-        self.dout_tensors = self._compute_backward(self.dev_tensors, out, dout)
         self.dref_tensors = self._compute_backward(self.ref_tensors, self.refout_tensors[0], dout)
         self.lp_dref_tensors = self._compute_backward(self.lp_ref_tensors, self.lp_refout_tensors[0], dout)
+        self.dout_tensors = self._compute_backward(self.dev_tensors, out, dout)
 
     @staticmethod
     def _validate(out, ref, lp_ref, fudge_factor, tname):
@@ -237,12 +257,93 @@ class SdpaContext(object):
         max_adiff = float(torch.max(torch.abs(x - y)))
         return torch.allclose(x, y, atol=atol, rtol=rtol), max_adiff
 
-    def validate_with_reference(self, out, grads):
+    def validate_with_reference(self, out, grads, *, no_backward=False):
         out_allclose, out_adiff = self._validate(out, self.refout_tensors[0], self.lp_refout_tensors[0], self.OUT_FUDGE_FACTOR, 'out')
+        if no_backward:
+            return out_allclose, out_adiff, [], []
         grads_allclose = []
         grads_adiff = []
-        for grad, ref, lp_ref, fudge_factor, tname in zip(grads, self.dref_tensors, self.lp_dref_tensors, self.FUDGE_FACTORS, self.TENSOR_NAMES):
+        for grad, ref, lp_ref, fudge_factor, tname in zip(grads, self.dref_tensors, self.lp_dref_tensors, self.fudge_factors, self.TENSOR_NAMES):
             allclose, adiff = self._validate(grad, ref, lp_ref, fudge_factor, tname)
             grads_allclose.append(allclose)
             grads_adiff.append(adiff)
         return out_allclose, out_adiff, grads_allclose, grads_adiff
+
+class VarlenSdpaContext(SdpaContext):
+    TENSOR_NAMES = ('q', 'k', 'v', 'b')
+
+    @staticmethod
+    def _rng_varlen_tensor(num_heads, seqlens, head_dim, dtype, device, packed=False):
+        # Note: do NOT use nested tensor here
+        #       PyTorch's UT can use nested tensor because PyTorch preprocessed
+        #       the input nested tensors before sending them to its SDPA
+        #       backends (See sdpa_nested_preprocessing in
+        #       aten/src/ATen/native/nested/cuda/NestedTensorTransformerUtils.cpp)
+        #
+        #       AOTriton works in the same level as PyTorch's SDPA backends and
+        #       its UT should generate the tensor in the preprocessed format directly.
+        dims = (1, np.sum(seqlens), num_heads, head_dim)
+        return torch.rand(*dims, dtype=dtype, device=device).transpose(1, 2)
+        '''
+        def _size(seqlen):
+            return (seqlen, num_heads, head_dim) if not packed else (seq_len[i], 3 * num_heads * head_dim)
+
+        return torch.nested.nested_tensor([
+            torch.rand(_size(seqlen), device=device, dtype=dtype, requires_grad=True)
+            for seqlen in seqlens])
+        '''
+
+    def __init__(self, N_HEADS, D_HEAD, seqlens_q, seqlens_k, dtype, device='cuda'):
+        q  = self._rng_varlen_tensor(N_HEADS, seqlens_q, D_HEAD, dtype, device)
+        k  = self._rng_varlen_tensor(N_HEADS, seqlens_k, D_HEAD, dtype, device)
+        v  = self._rng_varlen_tensor(N_HEADS, seqlens_k, D_HEAD, dtype, device)
+        b = None
+        self.dev_tensors = (q, k, v, b)
+        self.OUT_FUDGE_FACTOR = 3
+        self._seqlens_q = np.array(seqlens_q)
+        self._seqlens_k = np.array(seqlens_k)
+
+    # Not perfect but fits our needs.
+    @property
+    def seqlen_k(self):
+        return np.max(self._seqlens_q)
+
+    @staticmethod
+    def _compute_ref_forward_varlen(ref_tensors, seqlens_q, seqlens_k, p : SdpaParams):
+        packed_ref_q, packed_ref_k, packed_ref_v, _ = ref_tensors
+        packed_dropout_mask = p.dropout_mask if p.dropout_mask is None else p.dropout_mask.to(device=packed_ref_q.device)
+        ref_out_array = []
+        ref_mask_array = []
+        seqlen_q_start = 0
+        seqlen_k_start = 0
+        for i, (seqlen_q, seqlen_k) in enumerate(zip(seqlens_q, seqlens_k)):
+            ref_q = packed_ref_q[0, :, seqlen_q_start:seqlen_q_start+seqlen_q, :]
+            ref_k = packed_ref_k[0, :, seqlen_k_start:seqlen_k_start+seqlen_k, :]
+            ref_v = packed_ref_v[0, :, seqlen_k_start:seqlen_k_start+seqlen_k, :]
+            dropout_mask = packed_dropout_mask[i, :, :, :] if packed_dropout_mask is not None else None
+            print(f'REF {seqlen_q_start=} {seqlen_q_start+seqlen_q=} {ref_q.shape=} {ref_k.shape=} {ref_v.shape=}')
+            print(f'REF {ref_q.stride()=}')
+            if dropout_mask is not None:
+                print(f'REF {packed_dropout_mask.shape=}')
+                print(f'REF {dropout_mask.shape=}')
+                dropout_mask = dropout_mask[:, :seqlen_q, :seqlen_k]  # Trim to actual seqlen
+                print(f'REF CLAMPED {dropout_mask.shape=}')
+                # print(f'REF {dropout_mask=}')
+            ref_out, ref_mask = torch.ops.aten._scaled_dot_product_attention_math(ref_q, ref_k, ref_v,
+                                                                        dropout_p=p.dropout_p,
+                                                                        is_causal=p.causal,
+                                                                        scale=p.sm_scale,
+                                                                        dropout_mask=dropout_mask)
+            ref_out_array.append(ref_out)
+            ref_mask_array.append(ref_mask)
+            seqlen_q_start += seqlen_q
+            seqlen_k_start += seqlen_k
+        ref_out = torch.cat(ref_out_array, dim=1).unsqueeze(dim=0)
+        return ref_out, None
+
+    def compute_ref_forward(self, p : SdpaParams):
+        self.fudge_factors = self._compute_fudge_factors(p)
+        self.refout_tensors = self._compute_ref_forward_varlen(self.ref_tensors, self._seqlens_q, self._seqlens_k, p)
+        self.lp_refout_tensors = self._compute_ref_forward_varlen(self.lp_ref_tensors, self._seqlens_q, self._seqlens_k, p)
+        return self.lp_refout_tensors
+

@@ -7,7 +7,8 @@ import tempfile
 import numpy as np
 
 import triton
-from triton.common import cuda_include_dir, libcuda_dirs
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.driver import include_dir, library_dirs
 
 kernel_utils_src = """
 import triton
@@ -99,16 +100,16 @@ static void read_csv_to_buffer(char *filename, int16_t *buffer, int size) {
 def gen_kernel_library(dir, libname):
     c_files = glob.glob(os.path.join(dir, "*.c"))
     subprocess.run(
-        ["gcc"] + c_files + ["-I", cuda_include_dir(), "-c", "-fPIC"],
+        ["gcc"] + c_files + ["-I", include_dir[0], "-c", "-fPIC"],
         check=True,
         cwd=dir,
     )
     o_files = glob.glob(os.path.join(dir, "*.o"))
-    subprocess.run(
-        ["gcc"] + o_files + ["-shared", "-o", libname, "-L", libcuda_dirs()[0]],
-        check=True,
-        cwd=dir,
-    )
+
+    command = ["gcc", *o_files, "-shared", "-o", libname]
+    for lib_dir in library_dirs():
+        command.extend(["-L", lib_dir])
+    subprocess.run(command, check=True, cwd=dir)
 
 
 def gen_test_bin(dir, M, N, K, exe="test", algo_id=0):
@@ -172,25 +173,14 @@ int main(int argc, char **argv) {{
     src = test_utils_src + test_src
     with open(os.path.join(dir, "test.c"), "w") as file:
         file.write(src)
-    subprocess.run(
-        ["gcc"] + [
-            "test.c",
-            "-I",
-            cuda_include_dir(),
-            "-L",
-            libcuda_dirs()[0],
-            "-l",
-            "cuda",
-            "-L",
-            dir,
-            "-l",
-            "kernel",
-            "-o",
-            exe,
-        ],
-        check=True,
-        cwd=dir,
-    )
+
+    command = ["gcc", "test.c"]
+    for inc_dir in include_dir:
+        command.extend(["-I", inc_dir])
+    for lib_dir in library_dirs():
+        command.extend(["-L", lib_dir])
+    command.extend(["-l", "cuda", "-L", dir, "-l", "kernel", "-o", exe])
+    subprocess.run(command, check=True, cwd=dir)
 
 
 def write_triton_kernels(dir, src, util_src):
@@ -437,7 +427,7 @@ def test_compile_link_autotune_matmul():
 def test_ttgir_to_ptx():
     src = """
 module attributes {"triton_gpu.num-warps" = 4 : i32, "triton_gpu.threads-per-warp" = 32 : i32, "triton_gpu.num-ctas" = 1 : i32} {
-  tt.func public @sum_kernel_0d1d(%arg0: !tt.ptr<i32, 1>, %arg1: !tt.ptr<i32, 1>) {
+  tt.func public @sum_kernel_0d1d(%arg0: !tt.ptr<i32>, %arg1: !tt.ptr<i32>) {
     tt.return
   }
 }
@@ -446,7 +436,7 @@ module attributes {"triton_gpu.num-warps" = 4 : i32, "triton_gpu.threads-per-war
         kernel_path = os.path.join(tmp_dir, "empty_kernel.ttgir")
         with open(kernel_path, "w") as fp:
             fp.write(src)
-        k = triton.compile(kernel_path, cc=80)
+        k = triton.compile(kernel_path, target=GPUTarget("cuda", 80, 32))
         ptx = k.asm["ptx"]
         assert ".target sm_80" in ptx
         assert ".address_size 64" in ptx

@@ -1,4 +1,5 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/Support/Signals.h"
 #include <gtest/gtest.h>
 
 using namespace mlir;
@@ -32,8 +33,8 @@ TEST_P(SwizzleDotOperandTestFixture, DotOperands) {
       triton::gpu::CTALayoutAttr::get(&ctx, {1, 1}, {1, 1}, {0, 1});
 
   // create encoding
-  auto parent = triton::gpu::MmaEncodingAttr::get(&ctx, 2, 0, {1, 1}, CTALayout,
-                                                  {16, 64, 16});
+  auto parent = triton::gpu::NvidiaMmaEncodingAttr::get(
+      &ctx, 2, 0, {1, 1}, CTALayout, {16, 64, 16});
   auto encoding = triton::gpu::DotOperandEncodingAttr::get(
       &ctx, params.opIdx, parent, 32 / params.typeWidth);
 
@@ -56,3 +57,9 @@ INSTANTIATE_TEST_SUITE_P(TestDotOperands, SwizzleDotOperandTestFixture,
                                            ParamT{{32, 32}, 1, 16, {8, 2, 4}},
                                            ParamT{{16, 16}, 0, 16, {8, 4, 2}},
                                            ParamT{{16, 16}, 1, 16, {8, 4, 2}}));
+
+int main(int argc, char *argv[]) {
+  llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

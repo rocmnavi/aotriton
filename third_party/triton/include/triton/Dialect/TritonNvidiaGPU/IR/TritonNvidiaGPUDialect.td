@@ -48,29 +48,15 @@ def TritonNvidiaGPU_Dialect : Dialect {
       if(!mod->hasAttr("triton_gpu.num-warps"))
         llvm::report_fatal_error(
             "TritonGPU module should contain a triton_gpu.num-warps attribute");
-      return mod->getAttr("triton_gpu.num-warps").cast<IntegerAttr>().getInt();
+      return cast<IntegerAttr>(mod->getAttr("triton_gpu.num-warps")).getInt();
     }
     static int getNumCTAs(ModuleOp mod) {
       if(!mod->hasAttr("triton_gpu.num-ctas"))
         llvm::report_fatal_error(
             "TritonGPU module should contain a triton_gpu.num-ctas attribute");
-      return mod->getAttr("triton_gpu.num-ctas").cast<IntegerAttr>().getInt();
-    }
-    static int getComputeCapability(ModuleOp mod) {
-      if(!mod->hasAttr("triton_gpu.compute-capability"))
-        llvm::report_fatal_error(
-            "TritonGPU module should contain a triton_gpu.compute-capability attribute");
-      return mod->getAttrOfType<IntegerAttr>("triton_gpu.compute-capability").getInt();
+      return cast<IntegerAttr>(mod->getAttr("triton_gpu.num-ctas")).getInt();
     }
     void registerTypes();
-
-    // Warp specialization related:
-    static std::string getWSSupportedAttrName() { return "triton_gpu.enable-warp-specialization"; }
-    static int getWSSupportedAttr(ModuleOp mod) {
-      auto name = getWSSupportedAttrName();
-      if (!mod->hasAttr(name)) return 0;
-      return mod->getAttrOfType<IntegerAttr>(name).getInt();
-    }
   }];
 
   let useDefaultTypePrinterParser = 1;

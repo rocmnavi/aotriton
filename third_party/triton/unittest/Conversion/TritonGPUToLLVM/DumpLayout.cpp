@@ -22,14 +22,36 @@
  */
 
 #include "DumpLayout.h"
-
-#include "../../../lib/Conversion/TritonGPUToLLVM/TritonGPUToLLVMBase.h"
-
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
+#ifdef AMD_TARGET
+#include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
+#include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
+#else
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/TargetInfo.h"
+#include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
+#endif
 namespace mlir {
 namespace triton {
 namespace gpu {
 
 namespace {
+
+#ifdef AMD_TARGET
+Value getMockSmemBaseImpl([[maybe_unused]] IRRewriter &rewriter,
+                          [[maybe_unused]] Location loc) {
+  return i32_val(0);
+}
+#else
+Value getMockSmemBaseImpl(IRRewriter &rewriter, Location loc) {
+  Value mockSmemBase =
+      LLVM::NVIDIA::getSRegValue(rewriter, loc, "%mock_smem_base");
+  auto llPtrTy = LLVM::LLVMPointerType::get(rewriter.getContext(), 3);
+  auto cast = rewriter.create<UnrealizedConversionCastOp>(
+      loc, TypeRange{llPtrTy}, ValueRange{mockSmemBase});
+  return cast.getResult(0);
+}
+#endif
 
 //===----------------------------------------------------------------------===//
 // IndexEmitter
@@ -37,31 +59,32 @@ namespace {
 
 class IndexEmitter {
 public:
-  struct Cache {
-    llvm::DenseMap<IndexCacheKeyT, llvm::SmallVector<Value>,
-                   CacheKeyDenseMapInfo>
-        baseIndexCache;
-    llvm::DenseMap<IndexCacheKeyT, llvm::SmallVector<llvm::SmallVector<Value>>,
-                   CacheKeyDenseMapInfo>
-        indexCache;
-    OpBuilder::InsertPoint indexInsertPoint;
-  };
-
   IndexEmitter(MLIRContext *context_)
-      : context(context_), option(context), typeConverter(context, option),
-        cacheInfo({&cache.baseIndexCache, &cache.indexCache,
-                   &cache.indexInsertPoint}),
-        base(typeConverter, cacheInfo), rewriter(context),
-        loc(UnknownLoc::get(context)) {
-    rewriter.setInsertionPointToStart(&block);
-    cache.indexInsertPoint = rewriter.saveInsertionPoint();
+      : context(context_), option(context), rewriter(context),
+        loc(UnknownLoc::get(context)),
+#ifdef AMD_TARGET
+        targetInfo("gfx942")
+#else
+        targetInfo(90)
+#endif
+  {
+    mlir::OpBuilder builder(context);
+    std::vector<mlir::Type> inTypes{};
+    std::vector<mlir::Type> outTypes{};
+    auto funcTy = builder.getFunctionType(inTypes, outTypes);
+    auto func = builder.create<mlir::triton::FuncOp>(loc, "test_func", funcTy);
+    auto mlirModule = mlir::ModuleOp::create(loc);
+    mlirModule.push_back(func);
+    auto *block = func.addEntryBlock();
+    rewriter.setInsertionPointToStart(block);
   }
 
   llvm::SmallVector<llvm::SmallVector<Value>>
   emitIndices(Attribute layout, llvm::ArrayRef<int64_t> shape,
               bool withCTAOffset) {
     auto type = RankedTensorType::get(shape, rewriter.getF16Type(), layout);
-    return base.emitIndices(loc, rewriter, layout, type, withCTAOffset);
+    return mlir::emitIndices(loc, rewriter, targetInfo, layout, type,
+                             withCTAOffset);
   }
 
   llvm::DenseMap<unsigned, Value>
@@ -69,34 +92,24 @@ public:
                           Type elemTy, llvm::ArrayRef<int64_t> shape,
                           bool withCTAOffset) {
     auto srcTy = RankedTensorType::get(shape, elemTy, srcLayout);
-    SharedMemoryObject smemObj(getMockSmemBase(), shape,
-                               sharedLayout.getOrder(), loc, rewriter);
-    return base.getSwizzledSharedPtrs(loc, /*inVec=*/1, srcTy, sharedLayout,
-                                      elemTy, smemObj, rewriter,
-                                      smemObj.offsets, smemObj.strides);
+    SharedMemoryObject smemObj(getMockSmemBaseImpl(rewriter, loc), elemTy,
+                               shape, sharedLayout.getOrder(), loc, rewriter);
+    return getSwizzledSharedPtrs(loc, targetInfo, /*inVec=*/1, srcTy,
+                                 sharedLayout, elemTy, smemObj, rewriter,
+                                 smemObj.offsets, smemObj.strides);
   }
 
 private:
-  Value getMockSmemBase() {
-    Value mockSmemBase =
-        mlir::LLVM::getSRegValue(rewriter, loc, "%mock_smem_base");
-    auto llPtrTy = LLVM::LLVMPointerType::get(
-        typeConverter.convertType(rewriter.getI8Type()), 3);
-    auto cast = rewriter.create<UnrealizedConversionCastOp>(
-        loc, TypeRange{llPtrTy}, ValueRange{mockSmemBase});
-    return cast.getResult(0);
-  }
-
   // Non-static members are initialized in declaration order
   MLIRContext *context;
   LowerToLLVMOptions option;
-  TritonGPUToLLVMTypeConverter typeConverter;
-  Cache cache;
-  ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo cacheInfo;
-  ConvertTritonGPUOpToLLVMPatternBase base;
-  Block block;
-  ConversionPatternRewriter rewriter;
+  IRRewriter rewriter;
   Location loc;
+#ifdef AMD_TARGET
+  AMD::TargetInfo targetInfo;
+#else
+  NVIDIA::TargetInfo targetInfo;
+#endif
 };
 
 //===----------------------------------------------------------------------===//
@@ -143,8 +156,7 @@ int evalGEPOp(mlir::LLVM::GEPOp gepOp, int ctaid, int tid) {
   assert(gepOp.getNumOperands() == 2 && "Unrecognized format of GEPOp");
   int base = eval(gepOp.getBase(), ctaid, tid);
   int offset = eval(gepOp.getOperand(1), ctaid, tid);
-  auto llPtrTy = gepOp.getRes().getType().cast<LLVM::LLVMPointerType>();
-  int bytesPerElem = llPtrTy.getElementType().getIntOrFloatBitWidth() / 8;
+  int bytesPerElem = gepOp.getElemType().getIntOrFloatBitWidth() / 8;
   return base + offset * bytesPerElem;
 }
 
@@ -153,7 +165,7 @@ int eval(Value value, int ctaid, int tid) {
   assert(op && "Unrecognized source value in the index expression");
   if (auto constantOp = llvm::dyn_cast<mlir::LLVM::ConstantOp>(op)) {
     auto attr = constantOp.getValue();
-    return attr.cast<mlir::IntegerAttr>().getInt();
+    return mlir::cast<mlir::IntegerAttr>(attr).getInt();
   } else if (auto addOp = llvm::dyn_cast<mlir::LLVM::AddOp>(op)) {
     return eval(addOp.getLhs(), ctaid, tid) + eval(addOp.getRhs(), ctaid, tid);
   } else if (auto mulOp = llvm::dyn_cast<mlir::LLVM::MulOp>(op)) {
@@ -164,25 +176,51 @@ int eval(Value value, int ctaid, int tid) {
   } else if (auto uremOp = llvm::dyn_cast<mlir::LLVM::URemOp>(op)) {
     return eval(uremOp.getLhs(), ctaid, tid) %
            eval(uremOp.getRhs(), ctaid, tid);
+  } else if (auto andOp = llvm::dyn_cast<mlir::LLVM::AndOp>(op)) {
+    return eval(andOp.getLhs(), ctaid, tid) & eval(andOp.getRhs(), ctaid, tid);
   } else if (auto xorOp = llvm::dyn_cast<mlir::LLVM::XOrOp>(op)) {
     return eval(xorOp.getLhs(), ctaid, tid) ^ eval(xorOp.getRhs(), ctaid, tid);
   } else if (auto trunciOp = llvm::dyn_cast<arith::TruncIOp>(op)) {
     return eval(trunciOp.getIn(), ctaid, tid);
+  } else if (auto idxCastOp = llvm::dyn_cast<arith::IndexCastOp>(op)) {
+    return eval(idxCastOp.getIn(), ctaid, tid);
   } else if (auto castOp = llvm::dyn_cast<UnrealizedConversionCastOp>(op)) {
     return eval(castOp.getOperand(0), ctaid, tid);
   } else if (auto threadOp = llvm::dyn_cast<mlir::gpu::ThreadIdOp>(op)) {
     return evalThreadIdOp(threadOp, ctaid, tid);
+  } else if (auto ctaIdOp =
+                 llvm::dyn_cast<mlir::triton::nvgpu::ClusterCTAIdOp>(op)) {
+    return ctaid;
   } else if (auto asmOp = llvm::dyn_cast<mlir::LLVM::InlineAsmOp>(op)) {
     return evalInlineAsmOp(asmOp, ctaid, tid);
   } else if (auto gepOp = llvm::dyn_cast<mlir::LLVM::GEPOp>(op)) {
     return evalGEPOp(gepOp, ctaid, tid);
+  } else if (auto bitcastOp = llvm::dyn_cast<mlir::LLVM::BitcastOp>(op)) {
+    return eval(bitcastOp.getOperand(), ctaid, tid);
+  } else if (auto selectOp = llvm::dyn_cast<mlir::LLVM::SelectOp>(op)) {
+    return eval(selectOp.getCondition(), ctaid, tid)
+               ? eval(selectOp.getTrueValue(), ctaid, tid)
+               : eval(selectOp.getFalseValue(), ctaid, tid);
+  } else if (auto icmpOp = llvm::dyn_cast<mlir::LLVM::ICmpOp>(op)) {
+    switch (icmpOp.getPredicate()) {
+    case mlir::LLVM::ICmpPredicate::eq:
+      return eval(icmpOp.getLhs(), ctaid, tid) ==
+             eval(icmpOp.getRhs(), ctaid, tid);
+    default:
+      llvm::report_fatal_error("Unsupported ICmp predicate");
+    }
   } else {
+    llvm::errs() << "Unrecognized op: " << *op << "\n";
     llvm::report_fatal_error("Unrecognized op type in the index expression");
     return 0;
   }
 }
 
 } // namespace
+
+int evalValue(Value value, int ctaid, int tid) {
+  return eval(value, ctaid, tid);
+}
 
 //===----------------------------------------------------------------------===//
 // Dump Distributed Layout
@@ -198,7 +236,7 @@ std::string dumpDistributedLayout(Attribute layout,
   assert(shape.size() <= 2 &&
          "High order tensor is not supported in dumpLayout");
 
-  int numThreads = 32 * getNumWarpsPerCTA(layout);
+  int numThreads = getWarpSize(layout) * getNumWarpsPerCTA(layout);
   int numCTAs = getNumCTAs(layout);
   auto f16Ty = FloatType::getF16(layout.getContext());
   int numElems = getTotalElemsPerThread(layout, shape, f16Ty);
@@ -310,7 +348,7 @@ std::string dumpSharedLayout(Attribute layout, llvm::ArrayRef<int64_t> shape,
   if (!multiCTA)
     assert(numCTAs == 1 && "numCTAs must be 1 when multiCTA is false");
 
-  auto sharedLayout = layout.cast<SharedEncodingAttr>();
+  auto sharedLayout = mlir::cast<SharedEncodingAttr>(layout);
   auto blockedLayout = BlockedEncodingAttr::get(
       /*context=*/layout.getContext(), /*shape=*/shape,
       /*sizePerThread=*/{1, 1}, /*order=*/sharedLayout.getOrder(),

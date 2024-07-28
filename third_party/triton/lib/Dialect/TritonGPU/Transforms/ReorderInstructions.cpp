@@ -9,6 +9,7 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
@@ -18,43 +19,63 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#define GEN_PASS_CLASSES
+
+namespace mlir {
+namespace triton {
+namespace gpu {
+
+#define GEN_PASS_DEF_TRITONGPUREORDERINSTRUCTIONS
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
-using namespace mlir;
-
-static inline bool
-willIncreaseRegisterPressure(triton::gpu::ConvertLayoutOp op) {
-  auto srcType = op.getOperand().getType().cast<RankedTensorType>();
-  auto dstType = op.getResult().getType().cast<RankedTensorType>();
-  auto srcEncoding = srcType.getEncoding();
-  auto dstEncoding = dstType.getEncoding();
-  if (srcEncoding.isa<triton::gpu::SharedEncodingAttr>())
+static bool willIncreaseRegisterPressure(Operation *op) {
+  if (isa<triton::gpu::LocalLoadOp>(op))
     return true;
-  if (dstEncoding.isa<triton::gpu::DotOperandEncodingAttr>())
+  auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op);
+  if (!cvt)
+    return false;
+  if (mlir::isa<triton::gpu::DotOperandEncodingAttr>(
+          cvt.getType().getEncoding()))
     return true;
   return false;
 }
 
 class TritonGPUReorderInstructionsPass
-    : public TritonGPUReorderInstructionsBase<
+    : public impl::TritonGPUReorderInstructionsBase<
           TritonGPUReorderInstructionsPass> {
 public:
   TritonGPUReorderInstructionsPass() = default;
 
+  Operation *getFirstUse(Operation *op) {
+    std::vector<Operation *> users;
+    for (auto user : op->getUsers()) {
+      if (Operation *ancestor = op->getBlock()->findAncestorOpInBlock(*user))
+        users.push_back(ancestor);
+    }
+    auto minOpIt = std::min_element(users.begin(), users.end(),
+                                    [](mlir::Operation *a, mlir::Operation *b) {
+                                      return a->isBeforeInBlock(b);
+                                    });
+    return minOpIt != users.end() ? *minOpIt : nullptr;
+  }
+
   void runOnOperation() override {
     ModuleOp m = getOperation();
     mlir::DominanceInfo dom(m);
+    // sink conversion after the last dealloc
+    // before the first use ancestor in its block
+    m.walk([&](triton::gpu::ConvertLayoutOp op) {
+      auto curr = mlir::Block::iterator(op);
+      for (; &*curr != getFirstUse(op); curr++)
+        if (isa<triton::gpu::LocalDeallocOp>(&*curr))
+          op->moveAfter(&*curr);
+    });
     // Sink conversions into loops when they will increase
     // register pressure
     DenseMap<Operation *, Operation *> opToMove;
     auto moveAfter = [](Operation *lhs, Operation *rhs) {
-      auto lhsId = getWSRoleId(lhs);
-      auto rhsId = getWSRoleId(rhs);
-      if (lhsId == rhsId)
-        lhs->moveAfter(rhs);
+      lhs->moveAfter(rhs);
     };
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
+    m.walk([&](Operation *op) {
       if (!willIncreaseRegisterPressure(op))
         return;
       auto user_begin = op->user_begin();
@@ -68,24 +89,11 @@ public:
     });
     for (auto &kv : opToMove)
       kv.first->moveBefore(kv.second);
-    // Move convert(load) immediately after dependent load
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
-      auto dstType = op.getResult().getType().cast<RankedTensorType>();
-      auto dstEncoding = dstType.getEncoding();
-      // Enable moving shared->dot conversion after dependent load.
-      // For the Q tensor in flash attention, the shared->dot conversion acts as
-      // a loop invariant. Moving this conversion post dependent load,
-      // will hoist the conversion outside the loop. Consequently, during
-      // computation, we will be able to maintain the Q tensor in the registers.
-#ifdef USE_ROCM
-      if (!dstEncoding.isa<triton::gpu::SharedEncodingAttr>() &&
-          !dstEncoding.isa<triton::gpu::DotOperandEncodingAttr>())
+    // Move alloc(load) immediately after dependent load
+    m.walk([&](triton::gpu::LocalAllocOp op) {
+      if (!op.getSrc())
         return;
-#elif
-      if (!dstEncoding.isa<triton::gpu::SharedEncodingAttr>())
-        return;
-#endif
-      Operation *argOp = op.getOperand().getDefiningOp();
+      Operation *argOp = op.getSrc().getDefiningOp();
       if (!argOp)
         return;
       moveAfter(op, argOp);
@@ -93,36 +101,28 @@ public:
     // Move transpositions just after their definition
     opToMove.clear();
     m.walk([&](triton::TransOp op) {
-      Operation *argOp = op.getOperand().getDefiningOp();
+      Operation *argOp = op.getSrc().getDefiningOp();
       if (!argOp)
         return;
       moveAfter(op, argOp);
     });
     // Move `dot` operand so that conversions to opIdx=1 happens after
     // conversions to opIdx=0
-#ifdef USE_ROCM
-    // Skip this reordering for ROCm backend since it will sink shared->dot
-    // conversion for Q tensor in flash attention into the main loop. This
-    // increases LDS pressure and requires additional computation in every loop
-    // iteration.
-    return;
-#endif
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
-      auto dstType = op.getResult().getType().cast<RankedTensorType>();
-      auto dstEncoding =
-          dstType.getEncoding().dyn_cast<triton::gpu::DotOperandEncodingAttr>();
+    m.walk([&](triton::gpu::LocalLoadOp op) {
+      auto dstEncoding = mlir::dyn_cast<triton::gpu::DotOperandEncodingAttr>(
+          op.getType().getEncoding());
       if (!dstEncoding)
         return;
       int opIdx = dstEncoding.getOpIdx();
       if (opIdx != 1)
         return;
-      if (op->getUsers().empty())
+      if (!op->hasOneUse())
         return;
       auto dotUser = dyn_cast<triton::DotOp>(*op->user_begin());
       if (!dotUser)
         return;
       auto AOp =
-          dotUser.getOperand(0).getDefiningOp<triton::gpu::ConvertLayoutOp>();
+          dotUser.getOperand(0).getDefiningOp<triton::gpu::LocalLoadOp>();
       if (!AOp)
         return;
       // Check that the conversion to OpIdx=1 happens before and can be moved
@@ -135,6 +135,6 @@ public:
   }
 };
 
-std::unique_ptr<Pass> mlir::createTritonGPUReorderInstructionsPass() {
-  return std::make_unique<TritonGPUReorderInstructionsPass>();
-}
+} // namespace gpu
+} // namespace triton
+} // namespace mlir

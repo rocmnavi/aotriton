@@ -1,15 +1,7 @@
-add_mlir_dialect_library(TritonNvidiaGPUTransforms
-  MaterializeLoadStore.cpp
-  PlanCTA.cpp
-  WSDecomposing.cpp
-  WSFeasibilityChecking.cpp
-  WSPipeline.cpp
-  WSMutex.cpp
-  WSMaterialization.cpp
-  WSFixupMissingAttrs.cpp
+add_triton_library(TritonNvidiaGPUTransforms
   FenceInsertion.cpp
-  RewriteTensorPointer.cpp
-  Utility.cpp
+  PlanCTA.cpp
+  TMALowering.cpp
 
   DEPENDS
   TritonNvidiaGPUTransformsIncGen

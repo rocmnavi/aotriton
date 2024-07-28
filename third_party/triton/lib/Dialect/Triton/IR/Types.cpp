@@ -1,5 +1,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
+
 #include "mlir/IR/DialectImplementation.h" // required by `Types.cpp.inc`
+#include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/TypeSwitch.h" // required by `Types.cpp.inc`
 
@@ -40,7 +42,66 @@ Type PointerType::parse(AsmParser &parser) {
 }
 
 void PointerType::print(AsmPrinter &printer) const {
-  printer << "<" << getPointeeType() << ", " << getAddressSpace() << ">";
+  if (getAddressSpace() == 1) {
+    printer << "<" << getPointeeType() << ">";
+  } else {
+    printer << "<" << getPointeeType() << ", " << getAddressSpace() << ">";
+  }
+}
+
+static constexpr llvm::StringRef kMutableMemory = "mutable";
+
+Type MemDescType::parse(AsmParser &parser) {
+  if (parser.parseLess())
+    return Type();
+
+  SmallVector<int64_t> dimensions;
+  if (parser.parseDimensionList(dimensions, /*allowDynamic=*/false))
+    return Type();
+
+  // Parse the element type.
+  Type elementType;
+  if (parser.parseType(elementType))
+    return Type();
+
+  Attribute encoding;
+  if (succeeded(parser.parseOptionalComma())) {
+    if (parser.parseAttribute(encoding))
+      return Type();
+  }
+  bool mutableMemory = false;
+  Attribute memorySpace;
+  if (succeeded(parser.parseOptionalComma())) {
+    if (failed(parser.parseOptionalKeyword(kMutableMemory))) {
+      if (parser.parseAttribute(memorySpace))
+        return Type();
+    } else {
+      mutableMemory = true;
+    }
+  }
+  if (mutableMemory == false && succeeded(parser.parseOptionalComma())) {
+    if (parser.parseOptionalKeyword(kMutableMemory))
+      return Type();
+    mutableMemory = true;
+  }
+  if (parser.parseGreater())
+    return Type();
+  return MemDescType::get(parser.getContext(), dimensions, elementType,
+                          encoding, memorySpace, mutableMemory);
+}
+
+void MemDescType::print(AsmPrinter &printer) const {
+  printer << "<";
+  for (auto dim : getShape())
+    printer << dim << "x";
+  printer << getElementType();
+  if (getEncoding())
+    printer << ", " << getEncoding();
+  if (getMemorySpace())
+    printer << ", " << getMemorySpace();
+  if (getMutableMemory())
+    printer << ", " << kMutableMemory;
+  printer << ">";
 }
 
 namespace mlir {
@@ -49,27 +110,27 @@ namespace triton {
 
 unsigned getPointeeBitWidth(Type type) {
   auto pointeeType = getPointeeType(type);
-  if (auto tensorTy = pointeeType.dyn_cast<RankedTensorType>())
+  if (auto tensorTy = dyn_cast<RankedTensorType>(pointeeType))
     return tensorTy.getElementType().getIntOrFloatBitWidth();
   return pointeeType.getIntOrFloatBitWidth();
 }
 
 Type getI1SameShape(Type type) {
   auto i1Type = IntegerType::get(type.getContext(), 1);
-  if (auto tensorTy = type.dyn_cast<RankedTensorType>())
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type))
     return RankedTensorType::get(tensorTy.getShape(), i1Type,
                                  tensorTy.getEncoding());
   return i1Type;
 }
 
 Type getPointeeType(Type type) {
-  if (auto tensorTy = type.dyn_cast<RankedTensorType>()) {
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
     // Tensor of pointers
     auto shape = tensorTy.getShape();
-    auto ptrType = tensorTy.getElementType().dyn_cast<PointerType>();
+    auto ptrType = dyn_cast<PointerType>(tensorTy.getElementType());
     Type pointeeType = ptrType.getPointeeType();
     return RankedTensorType::get(shape, pointeeType, tensorTy.getEncoding());
-  } else if (auto ptrType = type.dyn_cast<PointerType>()) {
+  } else if (auto ptrType = dyn_cast<PointerType>(type)) {
     // scalar pointer
     Type pointeeType = ptrType.getPointeeType();
     return pointeeType;
@@ -79,14 +140,14 @@ Type getPointeeType(Type type) {
 
 Type getI32SameShape(Type type) {
   auto i32Type = IntegerType::get(type.getContext(), 32);
-  if (auto tensorTy = type.dyn_cast<RankedTensorType>())
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type))
     return RankedTensorType::get(tensorTy.getShape(), i32Type,
                                  tensorTy.getEncoding());
   return i32Type;
 }
 
 Type getPointerTypeSameShape(Type type) {
-  if (auto tensorTy = type.dyn_cast<RankedTensorType>()) {
+  if (auto tensorTy = dyn_cast<RankedTensorType>(type)) {
     Type elementType = tensorTy.getElementType();
     auto shape = tensorTy.getShape();
     PointerType ptrType = PointerType::get(elementType, 1);
@@ -99,18 +160,18 @@ Type getPointerTypeSameShape(Type type) {
 Type getPointerType(Type type) { return PointerType::get(type, 1); }
 
 bool isTensorPointerType(Type type) {
-  if (auto ptrType = type.dyn_cast<PointerType>())
-    return ptrType.getPointeeType().isa<RankedTensorType>();
+  if (auto ptrType = dyn_cast<PointerType>(type))
+    return isa<RankedTensorType>(ptrType.getPointeeType());
   return false;
 }
 
 bool isTensorOrTensorPointerType(Type type) {
-  return type.isa<RankedTensorType>() || isTensorPointerType(type);
+  return isa<RankedTensorType>(type) || isTensorPointerType(type);
 }
 
 Type getElementTypeOfTensorPointerType(Type type) {
-  if (auto ptrType = type.dyn_cast<PointerType>())
-    if (auto tensorTy = ptrType.getPointeeType().dyn_cast<RankedTensorType>())
+  if (auto ptrType = dyn_cast<PointerType>(type))
+    if (auto tensorTy = dyn_cast<RankedTensorType>(ptrType.getPointeeType()))
       return tensorTy.getElementType();
   return {};
 }

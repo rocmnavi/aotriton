@@ -3,6 +3,7 @@ import torch
 
 import triton
 import triton.language as tl
+from test_core import check_type_supported
 
 
 @triton.jit
@@ -17,29 +18,32 @@ def block_copy_kernel(a_ptr, b_ptr, N, BLOCK_SIZE: tl.constexpr, padding_option:
     tl.store(b_block_ptr, a, boundary_check=(0, ))
 
 
-@pytest.mark.parametrize("dtype_str, n, padding_option", [  #
-    (dtype_str, n, padding)
-    for dtype_str in ("bool", "int16", "float16")
+@pytest.mark.interpreter
+@pytest.mark.parametrize("dtypes_str, n, padding_option", [  #
+    (dtypes_str, n, padding)
+    for dtypes_str in (("bool", "bool"), ("int16", "int16"), ("int32", "int32"), ("float16", "float16"),
+                       ("float32", "float32"), ("bfloat16", "bfloat16"))
     for n in (64, 128, 256, 512, 1024)
     for padding in ("zero", "nan")  #
 ])
-def test_block_copy(dtype_str, n, padding_option):
-    capability = torch.cuda.get_device_capability()
-    if torch.version.hip is None and capability[0] >= 9:
-        pytest.skip("Hopper support is working in progress")
-
-    dtype = getattr(torch, dtype_str)
-    if dtype_str in ("bool", "int16"):
+def test_block_copy(dtypes_str, n, padding_option, device):
+    src_dtype_str = dtypes_str[0]
+    dst_dtype_str = dtypes_str[1]
+    src_dtype = getattr(torch, src_dtype_str)
+    dst_dtype = getattr(torch, dst_dtype_str)
+    check_type_supported(src_dtype, device)
+    check_type_supported(dst_dtype, device)
+    if src_dtype_str in ("bool", "int16", "int32"):
         if padding_option == "nan":
             pytest.skip("Padding with NaN is not supported for integer types")
-        a = torch.randint(0, 2, (n, ), device="cuda", dtype=dtype)
+        a = torch.randint(0, 2, (n, ), device=device, dtype=src_dtype)
     else:
-        a = torch.randn((n, ), device="cuda", dtype=dtype)
-    b = torch.zeros((n, ), device="cuda", dtype=dtype)
+        a = torch.randn((n, ), device=device, dtype=src_dtype)
+    b = torch.zeros((n, ), device=device, dtype=dst_dtype)
 
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
     block_copy_kernel[grid](a_ptr=a, b_ptr=b, N=n, BLOCK_SIZE=64, padding_option=padding_option)
-
+    a.to(dst_dtype)
     assert torch.all(a[0:n // 2] == b[0:n // 2])
     if padding_option == "zero":
         assert torch.all(b[n // 2:n] == 0)
@@ -73,6 +77,7 @@ def matmul_no_scf_with_advance_kernel(  #
     tl.store(c_ptrs, c)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("shape, num_warps", [  #
     (shape, num_warps) for shape in [
         [64, 64, 16],
@@ -80,15 +85,11 @@ def matmul_no_scf_with_advance_kernel(  #
         [64, 64, 64],
     ] for num_warps in [4, 8]
 ])
-def test_block_ptr_matmul_no_scf(shape, num_warps):
-    capability = torch.cuda.get_device_capability()
-    if torch.version.hip is None and capability[0] >= 9:
-        pytest.skip("Hopper support is working in progress")
-
+def test_block_ptr_matmul_no_scf(shape, num_warps, device):
     m, n, k = shape
-    a = torch.randn((m, k), device="cuda", dtype=torch.float16)
-    b = torch.randn((k, n), device="cuda", dtype=torch.float16)
-    c = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    a = torch.randn((m, k), device=device, dtype=torch.float16)
+    b = torch.randn((k, n), device=device, dtype=torch.float16)
+    c = torch.empty((m, n), device=device, dtype=torch.float32)
 
     grid = lambda META: (1, )
     matmul_no_scf_with_advance_kernel[grid](

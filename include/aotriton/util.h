@@ -37,6 +37,8 @@ enum GpuArch : uint64_t {
   GPU_ARCH_UNKNOWN = 0,
   GPU_ARCH_AMD_GFX90A = CAT(GpuVendor::kAMD, 0x90a),
   GPU_ARCH_AMD_GFX942 = CAT(GpuVendor::kAMD, 0x942),
+  GPU_ARCH_AMD_GFX1100 = CAT(GpuVendor::kAMD, 0x1100),
+  GPU_ARCH_AMD_GFX1101 = CAT(GpuVendor::kAMD, 0x1101),
 };
 
 template<int Rank>
@@ -90,6 +92,12 @@ public:
     return dtype_;
   }
 
+  static TensorView<Rank> get_null_tensor(DType dtype) {
+      return TensorView<Rank>{0,
+                              std::array<uint64_t, Rank>{},
+                              std::array<uint64_t, Rank>{},
+                              dtype};
+  }
 private:
   const void* base_ = nullptr;
   std::array<uint64_t, Rank> sizes_;

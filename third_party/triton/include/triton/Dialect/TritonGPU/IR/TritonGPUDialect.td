@@ -23,22 +23,15 @@ def TritonGPU_Dialect : Dialect {
   let extraClassDeclaration = [{
     static std::string getNumWarpsAttrName() { return "triton_gpu.num-warps"; }
     static int getNumWarps(ModuleOp mod) {
-      if(!mod->hasAttr("triton_gpu.num-warps"))
+      if (!mod->hasAttr("triton_gpu.num-warps"))
         llvm::report_fatal_error(
             "TritonGPU module should contain a triton_gpu.num-warps attribute");
-      return mod->getAttr("triton_gpu.num-warps").cast<IntegerAttr>().getInt();
+      return cast<IntegerAttr>(mod->getAttr("triton_gpu.num-warps")).getInt();
     }
     static int getNumCTAs(ModuleOp mod) {
-      if(!mod->hasAttr("triton_gpu.num-ctas"))
-        llvm::report_fatal_error(
-            "TritonGPU module should contain a triton_gpu.num-ctas attribute");
-      return mod->getAttr("triton_gpu.num-ctas").cast<IntegerAttr>().getInt();
-    }
-    static int getComputeCapability(ModuleOp mod) {
-      if(!mod->hasAttr("triton_gpu.compute-capability"))
-        llvm::report_fatal_error(
-            "TritonGPU module should contain a triton_gpu.compute-capability attribute");
-      return mod->getAttrOfType<IntegerAttr>("triton_gpu.compute-capability").getInt();
+      if (!mod->hasAttr("triton_gpu.num-ctas"))
+        return 1;
+      return cast<IntegerAttr>(mod->getAttr("triton_gpu.num-ctas")).getInt();
     }
     void registerTypes();
 
@@ -47,20 +40,13 @@ def TritonGPU_Dialect : Dialect {
     static int getThreadsPerWarp(ModuleOp mod) {
       Attribute threadsPerWarp = mod->getDiscardableAttr("triton_gpu.threads-per-warp");
       if(!threadsPerWarp) {
-        return TRITONGPU_DEFAULT_WARPSIZE;
+        return 32;
       }
-      return threadsPerWarp.cast<IntegerAttr>().getInt();
+      return cast<IntegerAttr>(threadsPerWarp).getInt();
     }
-    static int getSharedSize(ModuleOp mod) {
-      Attribute sharedAttr = mod->getDiscardableAttr("triton_gpu.shared");
-      if(!sharedAttr) {
-        return 0;
-      }
-      return sharedAttr.cast<IntegerAttr>().getInt();
-    }
-
   }];
 
+  let useDefaultTypePrinterParser = 1;
   let useDefaultAttributePrinterParser = 1;
   let usePropertiesForAttributes = 1;
 }

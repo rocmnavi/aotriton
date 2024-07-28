@@ -1,7 +1,8 @@
-#include "triton/Target/LLVMIR/Passes.h"
-
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
+#include "triton/Target/LLVMIR/Passes.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Path.h"
@@ -73,27 +74,38 @@ struct LLVMDIScopePass : public LLVMDIScopeBase<LLVMDIScopePass> {
           context, llvm::sys::path::filename(inputFilePath),
           llvm::sys::path::parent_path(inputFilePath));
     }
-    if (!compileUnitAttr) {
-      compileUnitAttr = LLVM::DICompileUnitAttr::get(
-          context, llvm::dwarf::DW_LANG_C, fileAttr,
-          StringAttr::get(context, "triton"), /*isOptimized=*/true,
-          LLVM::DIEmissionKind::LineTablesOnly);
-    }
     auto subroutineTypeAttr =
         LLVM::DISubroutineTypeAttr::get(context, llvm::dwarf::DW_CC_normal, {});
+
+    // Figure out debug information (`subprogramFlags` and `compileUnitAttr`) to
+    // attach to the function definition / declaration. External functions are
+    // declarations only, and are defined in a different compile unit, so mark
+    // them appropriately in `subprogramFlags`, and set an empty
+    // `compileUnitAttr`.
+    DistinctAttr distinctId;
+    auto subprogramFlags = LLVM::DISubprogramFlags::Optimized;
+    if (!funcOp.isExternal()) {
+      distinctId = mlir::DistinctAttr::create(mlir::UnitAttr::get(context));
+      if (!compileUnitAttr) {
+        compileUnitAttr = LLVM::DICompileUnitAttr::get(
+            distinctId, llvm::dwarf::DW_LANG_C, fileAttr,
+            StringAttr::get(context, "triton"),
+            /*isOptimized=*/true, LLVM::DIEmissionKind::LineTablesOnly);
+      }
+      subprogramFlags = subprogramFlags | LLVM::DISubprogramFlags::Definition;
+    } else {
+      compileUnitAttr = {};
+    }
 
     StringAttr funcNameAttr = funcOp.getNameAttr();
     // Note that scopeline is set differently from LLVM's
     // DIScopeForLLVMFuncOpPass. I don't find reasons why scopeline should be
     // the column offset
-    auto subprogramAttr =
-        LLVM::DISubprogramAttr::get(context, compileUnitAttr, fileAttr,
-                                    funcNameAttr, funcNameAttr, fileAttr,
-                                    /*line=*/line,
-                                    /*scopeline=*/line,
-                                    LLVM::DISubprogramFlags::Definition |
-                                        LLVM::DISubprogramFlags::Optimized,
-                                    subroutineTypeAttr);
+    auto subprogramAttr = LLVM::DISubprogramAttr::get(
+        context, distinctId, compileUnitAttr, fileAttr, funcNameAttr,
+        funcNameAttr, fileAttr,
+        /*line=*/line,
+        /*scopeline=*/line, subprogramFlags, subroutineTypeAttr);
     funcOp->setLoc(FusedLoc::get(context, {loc}, subprogramAttr));
   }
 
@@ -107,9 +119,9 @@ struct LLVMDIScopePass : public LLVMDIScopeBase<LLVMDIScopePass> {
         llvm::sys::path::parent_path(calleeFileName));
     auto lexicalBlockFileAttr = LLVM::DILexicalBlockFileAttr::get(
         context, scopeAttr, calleeFileAttr, /*discriminator=*/0);
-    Location loc = op->getLoc();
-    if (calleeLoc.isa<CallSiteLoc>()) {
-      auto nestedLoc = calleeLoc.cast<CallSiteLoc>().getCallee();
+    Location loc = calleeLoc;
+    if (mlir::isa<CallSiteLoc>(calleeLoc)) {
+      auto nestedLoc = mlir::cast<CallSiteLoc>(calleeLoc).getCallee();
       loc = getNestedLoc(op, lexicalBlockFileAttr, nestedLoc);
     }
     return FusedLoc::get(context, {loc}, lexicalBlockFileAttr);
@@ -124,9 +136,10 @@ struct LLVMDIScopePass : public LLVMDIScopeBase<LLVMDIScopePass> {
       // We assemble the full inline stack so the parent of this loc must be a
       // function
       auto funcOp = op->getParentOfType<LLVM::LLVMFuncOp>();
-      auto funcOpLoc = funcOp.getLoc().cast<FusedLoc>();
-      scopeAttr = funcOpLoc.getMetadata().cast<LLVM::DISubprogramAttr>();
-      auto loc = getNestedLoc(op, scopeAttr, calleeLoc);
+      auto funcOpLoc = mlir::cast<FusedLoc>(funcOp.getLoc());
+      scopeAttr = mlir::cast<LLVM::DISubprogramAttr>(funcOpLoc.getMetadata());
+      auto loc =
+          CallSiteLoc::get(getNestedLoc(op, scopeAttr, calleeLoc), callerLoc);
       op->setLoc(loc);
     }
   }
