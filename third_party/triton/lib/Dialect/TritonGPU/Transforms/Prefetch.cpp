@@ -159,10 +159,13 @@ LogicalResult Prefetcher::initialize() {
   SmallVector<triton::DotOp> dotsInFor;
   for (Operation &op : *loop)
     if (auto dotOp = dyn_cast<triton::DotOp>(op)) {
-      // bail out if there exist non v2 dots.
-      auto dstEnc =
+      // Only accepts dotOps encoded as Nvidia MMA v2 or AMD MFMA
+      auto dstMmaEnc =
           dyn_cast<NvidiaMmaEncodingAttr>(getEncoding(dotOp.getResult()));
-      if (!dstEnc || dstEnc.getVersionMajor() != 2)
+      auto dstMfmaEnc =
+          dyn_cast<AMDMfmaEncodingAttr>(getEncoding(dotOp.getResult()));
+      if (!dstMfmaEnc && (!dstMmaEnc || dstMmaEnc.getVersionMajor() != 2))
+        // Don't rewrite if any other type is found.
         return failure();
       dotsInFor.push_back(dotOp);
     }
@@ -174,8 +177,6 @@ LogicalResult Prefetcher::initialize() {
   // when used in flash attention that has 2 dots in the loop
   if (dotsInFor.size() > 1)
     return failure();
-
-  // returns source of cvt
 
   // returns source of cvt
   auto getPrefetchSrc = [](Value v) -> SmallVector<Value> {
@@ -210,7 +211,7 @@ LogicalResult Prefetcher::initialize() {
     return Value();
   };
 
-  auto getYieldOp = [this](Value v) -> Value {
+  auto getYieldOperand = [this](Value v) -> Value {
     auto arg = mlir::cast<BlockArgument>(v);
     unsigned yieldIdx = arg.getArgNumber() - forOp.getNumInductionVars();
     return yieldOp.getOperand(yieldIdx);
@@ -256,8 +257,8 @@ LogicalResult Prefetcher::initialize() {
         dot2bHeaderDef[dot] = bHeaderDef;
         dot2aLoopArg[dot] = aSmem;
         dot2bLoopArg[dot] = bSmem;
-        dot2aYield[dot] = getYieldOp(aSmem);
-        dot2bYield[dot] = getYieldOp(bSmem);
+        dot2aYield[dot] = getYieldOperand(aSmem);
+        dot2bYield[dot] = getYieldOperand(bSmem);
       }
     }
   }
@@ -303,18 +304,28 @@ scf::ForOp Prefetcher::createNewForOp() {
     mapping.map(arg.value(), newForOp.getRegionIterArgs()[arg.index()]);
   mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
 
+  // The insertion point should be placed before the yield op
+  auto setInsertionPointBeforeYield = [](OpBuilder &builder,
+                                         scf::ForOp newForOp) {
+    if (newForOp.getBody()->mightHaveTerminator()) {
+      builder.setInsertionPoint(newForOp.getBody()->getTerminator());
+    } else {
+      builder.setInsertionPointToEnd(newForOp.getBody());
+    }
+  };
+
   for (Operation &op : forOp.getBody()->without_terminator()) {
     // If we're currently trying to sink a prefetched dot, we need to stop
     // sinking it (by resetting the insertion point to the end) if we find
     // control flow, or anything that depends on the dot op.
     if (op.getNumRegions() > 0) {
-      builder.setInsertionPointToEnd(newForOp.getBody());
+      setInsertionPointBeforeYield(builder, newForOp);
     }
     for (auto operand : op.getOperands()) {
       if (auto def = operand.getDefiningOp()) {
         auto dot = dyn_cast<triton::DotOp>(def);
         if (dot && dots.contains(dot)) {
-          builder.setInsertionPointToEnd(newForOp.getBody());
+          setInsertionPointBeforeYield(builder, newForOp);
         }
       }
     }

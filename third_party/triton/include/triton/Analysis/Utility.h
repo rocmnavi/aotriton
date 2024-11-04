@@ -62,7 +62,8 @@ public:
 
   unsigned getThreadsReductionAxis();
 
-  SmallVector<unsigned> getScratchConfig();
+  // The shape of the shared memory space needed for the reduction.
+  SmallVector<unsigned> getScratchRepShape();
 
   SmallVector<unsigned> getOrderWithAxisAtBeginning();
 
@@ -176,7 +177,9 @@ private:
 SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>
 getReshapeDecomposition(ArrayRef<int64_t> srcShape, ArrayRef<int64_t> dstShape);
 
-bool maybeSharedAllocationOp(Operation *op);
+// Returns the number of elements in the scratch space needed.
+// If shape is empty, it means no shared memory is needed.
+unsigned getNumScratchElements(ArrayRef<unsigned> shape);
 
 bool supportMFMA(triton::DotOp op);
 
@@ -186,17 +189,25 @@ bool supportMMA(triton::DotOp op, int version);
 
 bool supportMMA(Value value, int version);
 
-bool isSingleValue(Value value);
+// Conversion from `srcTy` to `dstTy` only involves reordering of registers.
+// There is no need for data exchange across threads, warps, or blocks.
+bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy);
 
+// Conversion from `srcTy` to `dstTy` involves data exchange across threads
+// within a warp.  No data exchange across warps or blocks is needed.
+bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy);
+
+// Conversion from `srcTy` to `dstTy` involves data exchange across threads,
+// warps, and possibly blocks.
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy);
 
-bool isMfmaToDotShortcut(RankedTensorType &srcTy, RankedTensorType &dstTy);
+bool atomicNeedsSharedMemory(Value result);
+
+bool isBlockedToDotShortcut(RankedTensorType &srcTy, RankedTensorType &dstT);
+
+bool isMfmaToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy);
 
 bool isMmaToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy);
-
-// TODO(jlebar): Remove this function; it's subsumed by the linear-layout case
-// in cvtNeedsSharedMemory.
-bool isMmaToMmaShortcut(RankedTensorType srcTy, RankedTensorType dstTy);
 
 // Return true if the src and dst layout match.
 bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
@@ -307,7 +318,7 @@ private:
     moduleOp.walk([&](Operation *op) {
       auto caller = op->getParentOfType<FunctionOpInterface>();
       if (auto callOp = dyn_cast<CallOpInterface>(op)) {
-        auto *callee = callOp.resolveCallable(&symbolTable);
+        auto *callee = callOp.resolveCallableInTable(&symbolTable);
         auto funcOp = dyn_cast_or_null<FunctionOpInterface>(callee);
         if (funcOp) {
           graph[caller].emplace_back(

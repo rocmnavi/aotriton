@@ -7,3 +7,19 @@ from ...autotune_binning import BinningLessOrEqual, BinningExact
 
 class FlashKernel(KernelDescription):
     KERNEL_FAMILY = 'flash'
+
+    def sancheck_lut_tensor(self,
+                            lut_tensor,
+                            fsels : 'list[ArgumentSelection]'):
+        def check_value(repr_name):
+            for fsel in fsels:
+                if fsel.repr_name == repr_name:
+                    return fsel.argument_value
+        is_causal = check_value('CAUSAL')
+        if lut_tensor.size == 1:
+            to_check = lut_tensor
+        elif is_causal:
+            to_check = lut_tensor.diagonal()
+        else:
+            to_check = lut_tensor
+        return (to_check >= 0).all()

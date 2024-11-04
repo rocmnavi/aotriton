@@ -23,10 +23,10 @@ namespace mlir::triton {
 // location" to a "logical tensor index".
 //
 // For example, suppose we have a 2D tensor T stored in GPU registers.  T's
-// layout is the function that, given a "hardware location" tuple of (thread-id,
-// warp-id), returns an index (x,y) into T.  In other words, if L(t,w) = (x,y)
-// is our linear layout func, then a register in thread t in warp w contains the
-// value T[x,y].
+// layout (i.e., L) is the function that, given a "hardware location" tuple of
+// (thread-id, warp-id), returns an index (x,y) into T.  In other words, if
+// L(t,w) = (x,y) is our linear layout func, then a register in thread t in warp
+// w contains the value T[x,y].
 //
 // The key fact about LLs is, the mapping from (t,w) to (x,y) is not arbitrary.
 // We only need to specify the value of L(t,w) at certain special points
@@ -37,11 +37,11 @@ namespace mlir::triton {
 // tensor T has shape 4x4.  We define the function L by choosing the values of
 // L(0,1), L(0,2), L(1,0), and L(2,0).  Our choices are shown below.
 //
-//               t/w   0     1     2    3
-//               0      ? (0,1) (0,2)   ?
-//    L(t,w) =   1  (1,1)     ?     ?   ?
-//               2  (2,2)     ?     ?   ?
-//               3      ?     ?     ?   ?
+//               t/w    0     1     2    3
+//               0      ? (0,1) (0,2)    ?
+//    L(t,w) =   1  (1,1)     ?     ?    ?
+//               2  (2,2)     ?     ?    ?
+//               3      ?     ?     ?    ?
 //
 // You only need to specify these four values to define the whole linear layout.
 // These special values are called the "basis vectors" or "bases" of the layout.
@@ -158,13 +158,13 @@ namespace mlir::triton {
 // ## Surjectivity and injectivity
 //
 // Most LLs are surjective, i.e. all output values are covered by some input
-// value.  But occasionally you might create a nonsurjective layout, usually via
-// invertAndCompose.  We aggressively assert that LLs are surjective unless you
-// explicitly create one that's not.
+// value.  But occasionally you might create a non-surjective layout, usually
+// via invertAndCompose.  We aggressively assert that LLs are surjective unless
+// you explicitly create one that's not.
 //
 // LLs are not, in general, injective.  There might exist multiple input values
 // that map to the same output value.  This represents the idea that the same
-// logical tensor element can be stored in multiple places in the hardware.
+// logical tensor elements can be stored in multiple places in the hardware.
 //
 // ## Why map hardware loc -> tensor index and not the other way around?
 //
@@ -276,7 +276,7 @@ namespace mlir::triton {
 //
 // That's all we need in order to define linear layouts mathematically!
 //
-// # Comaprison to Nvidia CuTe
+// # Comparison to Nvidia CuTe
 //
 // (Note, I'm not an expert on CuTe; this is my best understanding.)
 //
@@ -290,7 +290,7 @@ namespace mlir::triton {
 // subsume all of these special cases.  The CUTLASS folks say this simplified
 // CUTLASS, in the same way that we hope LLs will simplify Triton.
 //
-// Like CuTe layouts, LLs are also programmable and composible.  But there are
+// Like CuTe layouts, LLs are also programmable and composable.  But there are
 // also some differences.
 //
 //  - Dimensions in LLs are named; CuTe dimensions are numbered.
@@ -426,7 +426,6 @@ public:
 
   int32_t getBasis(StringAttr inDim, int32_t pos, StringAttr outDim) const {
     return getBasis(inDim, pos)[getOutDimIndex(outDim)];
-    ;
   }
 
   // These are in minor-to-major order, although if you don't flatten the dims
@@ -454,7 +453,7 @@ public:
   int32_t getTotalInDimSize() const { return 1 << getTotalInDimSizeLog2(); }
 
   // getOutDimSize(dim) == s means that there exists an input value that will
-  // produce each output value in [0,s).
+  // produce each output value in [0,s) (if the layout is surjective).
   //
   // For example, if our bases are
   //
@@ -578,11 +577,27 @@ public:
 
   // divideLeft and divideRight are the inverses of operator*.
   //
-  // If c = a * b, then a = c.divideRight(b) and b = c.divideLeft(a).
+  // Consider `a = c.divideRight(b)`, where `a` is a linear layout with
+  // `in-dims(a) == in-dims(b)` and `out-dims(a) == out-dims(c)`. We may remove
+  // some empty dimensions from `a` to form `a'` and still have `a' * b == c`.
+  // Therefore, there are multiple possible values that we could return for
+  // `(a * b).divideRight(b)` which would satisfy
+  // `((a * b).divideRight(b)) * b == a * b`.
+  //
+  // In the following example, we have `a * b == a' * b` when "in1" is an empty
+  // dimension that maps everything to 0:
+  //
+  //   a = L("in1", "in2") -> ("out1", "out2")
+  //   a' = L("in1") -> ("out1")
+  //   b = L("in2") -> ("out2")
+  //
+  // divideLeft and divideRight resolve this ambiguity by always returning the
+  // "canonical" quotient, namely the one with the fewest possible size-zero
+  // input and output dimensions.
   //
   // TODO(jlebar): Implement divideLeft.
   // std::optional<LinearLayout> divideLeft(const LinearLayout &divisor);
-  std::optional<LinearLayout> divideRight(const LinearLayout &divisor);
+  std::optional<LinearLayout> divideRight(const LinearLayout &divisor) const;
 
   // Gets a layout with only these in/out dimensions.
   //
@@ -664,6 +679,14 @@ public:
   // ambiguity in which offset we choose for a given (lane, warp).  For now we
   // don't place any guarantees on the choices made by this function.
   [[nodiscard]] LinearLayout invertAndCompose(const LinearLayout &outer) const;
+
+  // For each in-dim, returns a bitmask of the "free variables" in the layout
+  // function.
+  //
+  // These are the bits in the input that can be changed without changing the
+  // output.  If all of the free variables are 0, then the layout is injective
+  // (i.e. every input bit affects the output).
+  llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks() const;
 
   std::string toString() const;
 

@@ -8,6 +8,32 @@ import itertools
 import io
 import shutil
 import sys
+from pathlib import Path
+
+# TODO: merge with generate_compile.py
+
+GPU_TO_DIRECTORY = {
+    'MI200'  : 'amd-gfx90a',
+    'MI300X' : 'amd-gfx942',
+    'Navi31' : 'amd-gfx110x',
+    'Navi32' : 'amd-gfx110x',
+}
+
+GPU_TO_CLUSTER_SUFFIX = {
+    'MI200'  : 'MI200',
+    'MI300X' : 'MI300X',
+    'Navi31' : 'Navi3x',
+    'Navi32' : 'Navi3x',
+}
+
+class MissingLutEntry(Exception):
+    def __init__(self, ofn, fsels, lut_tensor):
+        self.ofn = ofn
+        self.fsels = fsels
+        self.lut_tensor = lut_tensor
+
+    def __repr__(self):
+        return f'{ofn} fsels={self._fsels} has broken tuning table:\n{lut_tensor}'
 
 class KernelTuningEntryForFunctionalOnGPU(object):
     LUT_TEMPLATE = get_template('autotune_table_entry.cc')
@@ -114,40 +140,30 @@ class KernelTuningEntryForFunctionalOnGPU(object):
             o = self._kdesc.build_object_file_description(kernel_image_dir, sig)
             yield o.c_identifier_signature, o._hsaco_kernel_path, o
 
-    def codegen_incbin_code(self, kernel_image_dir, compressed=False):
-        # INCBIN({incbin_symbol_name}, "{hsaco_kernel_path}");
-        incbin_lines = []
-        for incbin_symbol_name, hsaco_kernel_path, _ in self.gen_kernel_symbols(kernel_image_dir):
-            fn = hsaco_kernel_path.absolute()
-            if compressed:
-                fn = fn.parent / (fn.name + '.zst')
-            # incbin_lines.append(f'INCBIN({incbin_symbol_name}, "../gpu_kernel_image.{self._kdesc.SHIM_KERNEL_NAME}/{hsaco_kernel_path.name}")')
-            incbin_lines.append(f'INCBIN({incbin_symbol_name}, "{fn}")')
-        return ";\n".join(incbin_lines)
-
-    def codegen_incbin_names(self, kernel_image_dir, compressed=False):
-        incbin_lines = []
-        for incbin_symbol_name, _, _ in self.gen_kernel_symbols(kernel_image_dir):
-            incbin_lines.append(f'"{incbin_symbol_name}"')
-        return 'static const char* incbin_kernel_names[] = {\n  ' + ",\n  ".join(incbin_lines) + "\n};"
-
-    def codegen_kernel_psels(self, kernel_image_dir, compressed=False):
+    def codegen_kernel_psels(self, kernel_image_dir):
         lines = []
         for sig in self._sigs:
             lines.append(f'R"xyzw({sig.jsongen_psels()})xyzw"')
         return 'static const char* kernel_psels[] = {\n  ' + ",\n  ".join(lines) + "\n};"
 
-    def codegen_kernel_copts(self, kernel_image_dir, compressed=False):
+    def codegen_kernel_copts(self, kernel_image_dir):
         lines = []
         for sig in self._sigs:
             lines.append(f'R"xyzw({sig.jsongen_copts()})xyzw"')
         return 'static const char* kernel_copts[] = {\n  ' + ",\n  ".join(lines) + "\n};"
 
-    def codegen_kernel_image_objects(self, kernel_image_dir):
+    def codegen_package_path(self, kernel_image_dir):
+        for _, _, o in self.gen_kernel_symbols(kernel_image_dir):
+            dir_arch = Path(GPU_TO_DIRECTORY[o.target_gpu])
+            fonly = o.functional_signature + '_' + GPU_TO_CLUSTER_SUFFIX[o.target_gpu]
+            return 'R"xyzw(' + str(dir_arch / o.KERNEL_FAMILY / o.SHIM_KERNEL_NAME / fonly) + ')xyzw"'
+
+    def codegen_kernel_image_objects(self, kernel_image_dir, noimage_mode):
         kernel_image_symbols = []
-        for incbin_symbol_name, _, o in self.gen_kernel_symbols(kernel_image_dir):
-            assert o.compiled_files_exist, f'Compiled file {o._hsaco_kernel_path} not exists'
-            kernel_image_symbols.append(f'{{ mangle({incbin_symbol_name}), smangle({incbin_symbol_name}), {{ {o.num_warps * o.warp_size} , 1, 1 }}, {o.shared_memory_size} }},')
+        for _, _, o in self.gen_kernel_symbols(kernel_image_dir):
+            if not noimage_mode:
+                assert o.compiled_files_exist, f'Compiled file {o._hsaco_kernel_path} not exists'
+            kernel_image_symbols.append(f'{{ PACKAGE_PATH, "{o.obj.stem}" }},')
         ALIGN = '\n' + 4 * ' '
         return ALIGN.join(kernel_image_symbols)
 
@@ -158,7 +174,7 @@ class KernelTuningEntryForFunctionalOnGPU(object):
         ALIGN = ',\n' + 4 * ' '
         return ALIGN.join(kernel_image_perfs)
 
-    def write_lut_source(self, outdir : 'pathlib.Path', compressed, bare_mode):
+    def write_lut_source(self, library_suffix : str, outdir : 'pathlib.Path', bare_mode, noimage_mode):
         gpu_kernel_image_dir = outdir.parent / f'gpu_kernel_image.{self._kdesc.SHIM_KERNEL_NAME}'
         lut_tensor, sigs = self.get_lut()
         try:
@@ -168,6 +184,8 @@ class KernelTuningEntryForFunctionalOnGPU(object):
             raise e
         godel_number = first_sig.godel_number
         ofn = outdir / f'{first_sig.functional_signature}_{first_sig.target_gpu}.cc'
+        if not self._kdesc.sancheck_lut_tensor(lut_tensor, self._fsels):
+            raise MissingLutEntry(ofn, self._fsels, lut_tensor)
         if bare_mode:
             return ofn
         if ofn.exists():
@@ -177,15 +195,16 @@ class KernelTuningEntryForFunctionalOnGPU(object):
             old_content = ''
         mf = io.StringIO()  # Memory File
         d = {
-            'incbin_kernel_images'  : self.codegen_incbin_code(gpu_kernel_image_dir, compressed=compressed),
-            'incbin_kernel_names'   : self.codegen_incbin_names(gpu_kernel_image_dir, compressed=compressed),
-            'kernel_psels'          : self.codegen_kernel_psels(gpu_kernel_image_dir, compressed=compressed),
-            'kernel_copts'          : self.codegen_kernel_copts(gpu_kernel_image_dir, compressed=compressed),
+            'library_suffix'        : library_suffix,
+            'kernel_psels'          : self.codegen_kernel_psels(gpu_kernel_image_dir),
+            'kernel_copts'          : self.codegen_kernel_copts(gpu_kernel_image_dir),
             'kernel_family_name'    : self._kdesc.KERNEL_FAMILY,
             'shim_kernel_name'      : self._kdesc.SHIM_KERNEL_NAME,
             'godel_number'          : godel_number,
             'perf_fields'           : ';\n    '.join(self._kdesc.perf_fields),
-            'kernel_image_objects'  : self.codegen_kernel_image_objects(gpu_kernel_image_dir),
+            'package_path'          : self.codegen_package_path(gpu_kernel_image_dir),
+            'kernel_image_objects'  : self.codegen_kernel_image_objects(gpu_kernel_image_dir,
+                                                                        noimage_mode=noimage_mode),
             'kernel_image_perfs'    : self.codegen_kernel_image_perfs(gpu_kernel_image_dir),
             'lut_dtype'             : self._lut_cdtype,
             'lut_shape'             : self._lut_cshape,

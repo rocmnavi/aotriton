@@ -4,6 +4,7 @@
 import itertools
 from collections import defaultdict
 import io
+import os
 from pathlib import Path
 from .kernel_argument import (
     ArgumentCategory,
@@ -15,6 +16,7 @@ from .object_desc import ObjectFileDescription
 from .gpu_targets import AOTRITON_SUPPORTED_GPUS, AOTRITON_GPU_WARPSIZE
 
 SOURCE_PATH = Path(__file__).resolve()
+AOTRITON_ENABLE_FP32 = bool(int(os.getenv('AOTRITON_ENABLE_FP32', True)))
 
 # We use [[ ]] instead of { } for C++ code template
 def get_template(name):
@@ -45,6 +47,7 @@ class KernelDescription(object):
     _ARGUMENT_CHOICES = None
     HEADER_TEMPLATE = get_template('shim.h')
     SOURCE_TEMPLATE = get_template('shim.cc')
+    MAIN_DATATYPES = ['*fp16:16', '*bf16:16', '*fp32:16'] if AOTRITON_ENABLE_FP32 else ['*fp16:16', '*bf16:16']
 
     TYPE_CHOICES = {
     }
@@ -264,10 +267,12 @@ class KernelDescription(object):
             }
         print(self.HEADER_TEMPLATE.format_map(d), file=fout)
 
-    def write_shim_source(self, fout, object_files):
+    def write_shim_source(self, fout, object_files, noimage_mode):
         put_kernel_arguments_on_stack, let_kernel_arguments = self.codegen_kernel_arguments()
+        if not noimage_mode:
+            assert self.SHIM_KERNEL_NAME == object_files[0].binary_entrance
         d = { 'kernel_family_name'  : self.KERNEL_FAMILY,
-              'triton_kernel_name'  : object_files[0].binary_entrance,
+              'triton_kernel_name'  : self.SHIM_KERNEL_NAME,
               'shim_kernel_name'    : self.SHIM_KERNEL_NAME,
               'param_class_name'    : self.param_class_name,
               'context_class_name'  : self.context_class_name,
@@ -393,3 +398,7 @@ class KernelDescription(object):
             lets.append(4 * ' ' + '},')
         return '\n'.join(lets)
 
+    def sancheck_lut_tensor(self,
+                            lut_tensor,
+                            fsels : 'list[ArgumentSelection]'):
+        raise NotImplemented(f'{self.__class__}.sancheck_lut_tensor')

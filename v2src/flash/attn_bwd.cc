@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+#include <aotriton/config.h>
 #include <aotriton/_internal/util.h>
 #include <aotriton/flash.h>
 #include <aotriton/util.h>
@@ -10,16 +11,16 @@
 #include <flash/shim.bwd_preprocess_varlen.h>
 #include <iostream>
 
-namespace aotriton::v2::flash {
+namespace AOTRITON_NS::v2::flash {
 
 hipError_t
-bwd_preprocess(T4 out, T4 dout, T2 delta, aotriton::Stream stream_wrap) {
+bwd_preprocess(T4 out, T4 dout, T2 delta, AOTRITON_NS::Stream stream_wrap) {
   hipError_t err;
   auto stream = stream_wrap.native();
   auto arch = getArchFromStream(stream);
   auto grid_calculator = [](const BwdPreprocessParams& params) -> dim3 {
     dim3 grid {
-      aotriton::cdiv<uint32_t>(params.Out->size(2), params.BLOCK_M),
+      AOTRITON_NS::cdiv<uint32_t>(params.Out->size(2), params.BLOCK_M),
       uint32_t(params.Out->size(1)),
       uint32_t(params.Out->size(0)),
     };
@@ -57,13 +58,13 @@ bwd_preprocess_varlen(T4 out,
                       T2 delta,
                       T1 cu_seqlens_q,
                       int32_t max_seqlen_q,
-                      aotriton::Stream stream_wrap) {
+                      AOTRITON_NS::Stream stream_wrap) {
   hipError_t err;
   auto stream = stream_wrap.native();
   auto arch = getArchFromStream(stream);
   auto grid_calculator = [](const BwdPreprocessVarlenParams& params) -> dim3 {
     dim3 grid {
-      aotriton::cdiv<uint32_t>(params.Out->size(2), params.BLOCK_M),
+      AOTRITON_NS::cdiv<uint32_t>(params.Out->size(2), params.BLOCK_M),
       uint32_t(params.Out->size(1)),
       uint32_t(params.cu_seqlens_q->size(0) - 1),
     };
@@ -114,18 +115,19 @@ bwd_kernel_dk_dv(T4 q,
                  T2 softmax_lse,
                  T2 delta,
                  float dropout_p,
-                 uint64_t philox_seed,
-                 uint64_t philox_offset,
+                 T0 philox_seed,
+                 T0 philox_offset1,
+                 int64_t philox_offset2,
                  bool is_causal,
-                 aotriton::Stream stream_wrap,
+                 AOTRITON_NS::Stream stream_wrap,
                  BwdExtraArguments* extargs) {
   hipError_t err;
   auto stream = stream_wrap.native();
   auto arch = getArchFromStream(stream);
   auto grid_calculator = [max_seqlen_k](const BwdKernelDkDvParams& params) -> dim3 {
     dim3 grid {
-      aotriton::cdiv<uint32_t>(max_seqlen_k, params.BLOCK_N),
-      uint32_t(params.Q->size(1)),
+      AOTRITON_NS::cdiv<uint32_t>(max_seqlen_k, params.BLOCK_N),
+      uint32_t(params.K->size(1)),
       params.num_seqlens == 0 ? uint32_t(params.Q->size(0)) : params.num_seqlens,
     };
     // std::cerr << "bwd_kernel_dk_dv grid conf " << grid.x << " " << grid.y << " " << grid.z << std::endl;
@@ -133,6 +135,8 @@ bwd_kernel_dk_dv(T4 q,
   };
   constexpr int kMinHeadDimCompiled = 16;
   int head_size = q.size(3);
+  int num_head_q = q.size(1);
+  int num_head_k = k.size(1);
   int head_size_rounded = std::max(kMinHeadDimCompiled, bit_ceil(head_size));
   int bias_type = 0;
   if (b) {
@@ -150,6 +154,8 @@ bwd_kernel_dk_dv(T4 q,
     .sm_scale = sm_scale,
     .L = &softmax_lse,
     .D = &delta,
+    .num_head_q = num_head_q,
+    .num_head_k = num_head_k,
     .cu_seqlens_q = &cu_seqlens_q,
     .cu_seqlens_k = &cu_seqlens_k,
     .num_seqlens = num_seqlens,
@@ -157,8 +163,9 @@ bwd_kernel_dk_dv(T4 q,
     .max_seqlen_k = max_seqlen_k,
     .head_dim = head_size,
     .dropout_p = dropout_p,
-    .philox_seed = philox_seed,
-    .philox_offset_base = static_cast<uint32_t>(philox_offset),
+    .philox_seed_ptr = &philox_seed,
+    .philox_offset1 = &philox_offset1,
+    .philox_offset2 = static_cast<uint32_t>(philox_offset2),
     .BLOCK_DMODEL = head_size_rounded,
     .CAUSAL = is_causal,
     .ENABLE_DROPOUT = dropout_p > 0.0,
@@ -209,17 +216,18 @@ bwd_kernel_dq(T4 q,
               T2 softmax_lse,
               T2 delta,
               float dropout_p,
-              uint64_t philox_seed,
-              uint64_t philox_offset,
+              T0 philox_seed,
+              T0 philox_offset1,
+              int64_t philox_offset2,
               bool is_causal,
-              aotriton::Stream stream_wrap,
+              AOTRITON_NS::Stream stream_wrap,
               BwdExtraArguments* extargs) {
   hipError_t err;
   auto stream = stream_wrap.native();
   auto arch = getArchFromStream(stream);
   auto grid_calculator = [num_seqlens, max_seqlen_q](const BwdKernelDqParams& params) -> dim3 {
     dim3 grid {
-      aotriton::cdiv<uint32_t>(max_seqlen_q, params.BLOCK_M),
+      AOTRITON_NS::cdiv<uint32_t>(max_seqlen_q, params.BLOCK_M),
       uint32_t(params.Q->size(1)),
       params.num_seqlens == 0 ? uint32_t(params.Q->size(0)) : params.num_seqlens,
     };
@@ -228,6 +236,8 @@ bwd_kernel_dq(T4 q,
   };
   constexpr int kMinHeadDimCompiled = 16;
   int head_size = q.size(3);
+  int num_head_q = q.size(1);
+  int num_head_k = k.size(1);
   int head_size_rounded = std::max(kMinHeadDimCompiled, bit_ceil(head_size));
   int bias_type = 0;
   if (b) {
@@ -245,6 +255,8 @@ bwd_kernel_dq(T4 q,
     .sm_scale = sm_scale,
     .L = &softmax_lse,
     .D = &delta,
+    .num_head_q = num_head_q,
+    .num_head_k = num_head_k,
     .cu_seqlens_q = &cu_seqlens_q,
     .cu_seqlens_k = &cu_seqlens_k,
     .num_seqlens = num_seqlens,
@@ -252,8 +264,9 @@ bwd_kernel_dq(T4 q,
     .max_seqlen_k = max_seqlen_k,
     .head_dim = head_size,
     .dropout_p = dropout_p,
-    .philox_seed = philox_seed,
-    .philox_offset_base = static_cast<uint32_t>(philox_offset),
+    .philox_seed_ptr = &philox_seed,
+    .philox_offset1 = &philox_offset1,
+    .philox_offset2 = static_cast<uint32_t>(philox_offset2),
     .BLOCK_DMODEL = bit_ceil(head_size),
     .CAUSAL = is_causal,
     .ENABLE_DROPOUT = dropout_p > 0.0,
@@ -307,10 +320,11 @@ _attn_bwd_common(T4 q,
                  T2 softmax_lse,
                  T2 delta,
                  float dropout_p,
-                 uint64_t philox_seed,
-                 uint64_t philox_offset,
+                 T0 philox_seed,
+                 T0 philox_offset1,
+                 int64_t philox_offset2,
                  bool is_causal,
-                 aotriton::Stream stream,
+                 AOTRITON_NS::Stream stream,
                  BwdExtraArguments* extargs) {
   hipError_t ret;
   if (num_seqlens == 0)
@@ -337,7 +351,8 @@ _attn_bwd_common(T4 q,
                          delta,
                          dropout_p,
                          philox_seed,
-                         philox_offset,
+                         philox_offset1,
+                         philox_offset2,
                          is_causal,
                          stream,
                          extargs);
@@ -362,7 +377,8 @@ _attn_bwd_common(T4 q,
                       delta,
                       dropout_p,
                       philox_seed,
-                      philox_offset,
+                      philox_offset1,
+                      philox_offset2,
                       is_causal,
                       stream,
                       extargs);
@@ -384,10 +400,11 @@ attn_bwd(T4 q,
          T2 softmax_lse,
          T2 delta,
          float dropout_p,
-         uint64_t philox_seed,
-         uint64_t philox_offset,
+         T0 philox_seed,
+         T0 philox_offset1,
+         int64_t philox_offset2,
          bool is_causal,
-         aotriton::Stream stream,
+         AOTRITON_NS::Stream stream,
          BwdExtraArguments* extargs) {
   auto null_t1 = T1::get_null_tensor(DType::kInt32);
   return _attn_bwd_common(q,
@@ -410,7 +427,8 @@ attn_bwd(T4 q,
                           delta,
                           dropout_p,
                           philox_seed,
-                          philox_offset,
+                          philox_offset1,
+                          philox_offset2,
                           is_causal,
                           stream,
                           extargs);
@@ -435,10 +453,11 @@ attn_bwd_compact_varlen(T4 q,            // 1 x num_heads x total_q x head_size,
                         T2 softmax_lse,
                         T2 delta, // buffer, empty_like(softmax_lse)
                         float dropout_p,
-                        uint64_t philox_seed,
-                        uint64_t philox_offset,
+                        T0 philox_seed,
+                        T0 philox_offset1,
+                        int64_t philox_offset2,
                         bool is_causal,
-                        aotriton::Stream stream,
+                        AOTRITON_NS::Stream stream,
                         BwdExtraArguments* extargs) {
   return _attn_bwd_common(q,
                           k,
@@ -460,7 +479,8 @@ attn_bwd_compact_varlen(T4 q,            // 1 x num_heads x total_q x head_size,
                           delta,
                           dropout_p,
                           philox_seed,
-                          philox_offset,
+                          philox_offset1,
+                          philox_offset2,
                           is_causal,
                           stream,
                           extargs);

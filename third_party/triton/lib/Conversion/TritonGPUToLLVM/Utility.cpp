@@ -1,8 +1,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/IR/Attributes.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
-#include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/STLExtras.h"
@@ -164,7 +163,7 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   // Manually constant-fold the layout where possible.
   SmallVector<std::pair<StringAttr, int32_t>> constantIns;
   for (auto [inDimName, idx] : indices) {
-    if (auto constant = dyn_cast<LLVM::ConstantOp>(idx.getDefiningOp())) {
+    if (auto constant = idx.getDefiningOp<LLVM::ConstantOp>()) {
       constantIns.push_back(
           {inDimName, cast<IntegerAttr>(constant.getValue()).getInt()});
     } else {
@@ -184,7 +183,7 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   }
 
   for (auto [inDimName, idx] : indices) {
-    if (isa<LLVM::ConstantOp>(idx.getDefiningOp())) {
+    if (idx.getDefiningOp<LLVM::ConstantOp>()) {
       continue;
     }
 
@@ -204,17 +203,15 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
   return outIndices;
 }
 
-std::optional<SmallVector<SmallVector<Value>>>
-emitIndicesUsingLinearLayouts(Location loc, RewriterBase &rewriter,
-                              const TargetInfoBase &target, Attribute layout,
-                              RankedTensorType type, bool withCTAOffset) {
+SmallVector<SmallVector<Value>>
+emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+            Attribute layout, RankedTensorType type, bool withCTAOffset) {
   MLIRContext *ctx = rewriter.getContext();
   auto shape = type.getShape();
 
   std::optional<LinearLayout> ll = triton::gpu::toLinearLayout(shape, layout);
-  if (!ll.has_value()) {
-    return std::nullopt;
-  }
+  if (!ll.has_value())
+    llvm::report_fatal_error("Failed to convert layout to linear layout");
 
   // TODO(jlebar): We could add strong typing if we wanted; for now this is
   // "stringly typed".
@@ -264,36 +261,6 @@ emitIndicesUsingLinearLayouts(Location loc, RewriterBase &rewriter,
   }
 
   return ret;
-}
-
-std::optional<SmallVector<SmallVector<unsigned>>>
-emitOffsetForLayoutUsingLinearLayouts(Attribute layout, RankedTensorType type) {
-  MLIRContext *ctx = layout.getContext();
-  auto shape = type.getShape();
-  unsigned rank = shape.size();
-
-  std::optional<LinearLayout> ll = triton::gpu::toLinearLayout(shape, layout);
-  if (!ll.has_value()) {
-    return std::nullopt;
-  }
-
-  StringAttr kRegister = str_attr("register");
-  StringAttr kLane = str_attr("lane");
-  StringAttr kWarp = str_attr("warp");
-  StringAttr kBlock = str_attr("block");
-
-  SmallVector<SmallVector<unsigned>> offsets;
-  for (int i = 0; i < ll->getInDimSize(str_attr("register")); i++) {
-    auto idxs =
-        ll->apply({{kRegister, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
-    assert(idxs.size() == rank);
-    for (unsigned k = 0; k < rank; ++k) {
-      assert(idxs[k].first == str_attr("dim" + std::to_string(k)));
-    }
-    offsets.push_back(
-        llvm::to_vector_of<unsigned>(llvm::make_second_range(idxs)));
-  }
-  return offsets;
 }
 
 bool emitTransferBetweenRegistersAndShared(
@@ -353,6 +320,7 @@ bool emitTransferBetweenRegistersAndShared(
                       [&](auto offset) { return offset == 0; })) {
       return false;
     }
+    // Check if there's any cross CTA load.
     int32_t outBlock = idx.back();
     if (outBlock != inBlock) {
       return false;
@@ -381,7 +349,7 @@ bool emitTransferBetweenRegistersAndShared(
 
   int numElems = regToSharedLayout.getInDimSize(kRegister);
   auto vecTy = vec_ty(elemLlvmTy, vecElems);
-  auto ptrTy = ptr_ty(ctx, /*addressSpace=*/3);
+  auto ptrTy = shmemBase.getType();
   Value zero = i32_val(0);
   SmallVector<Value> ret;
   for (int i = 0; i < numElems / vecElems; i++) {
@@ -408,10 +376,11 @@ bool emitTransferBetweenRegistersAndShared(
   return true;
 }
 
-std::optional<SmallVector<Value>> loadSharedToRegistersUsingLinearLayouts(
-    RankedTensorType dstTy, MemDescType srcTy, Type elemLlvmTy,
-    SharedMemoryObject smemObj, Location loc, RewriterBase &rewriter,
-    const TargetInfoBase &target) {
+SmallVector<Value> loadSharedToDistributed(RankedTensorType dstTy,
+                                           MemDescType srcTy, Type elemLlvmTy,
+                                           SharedMemoryObject smemObj,
+                                           Location loc, RewriterBase &rewriter,
+                                           const TargetInfoBase &target) {
   SmallVector<Value> ret;
   bool success = emitTransferBetweenRegistersAndShared(
       dstTy, srcTy, elemLlvmTy, /*maxVecElems=*/std::nullopt, smemObj.getBase(),
@@ -425,17 +394,17 @@ std::optional<SmallVector<Value>> loadSharedToRegistersUsingLinearLayouts(
           ret.push_back(extract_element(elemLlvmTy, vecVal, i32_val(v)));
         }
       });
-  if (!success) {
-    return std::nullopt;
-  }
+  if (!success)
+    llvm::report_fatal_error("Failed to emit transfer from shared to register");
 
   return ret;
 }
 
-bool storeDistributedToSharedUsingLinearLayouts(
-    MemDescType dstTy, RankedTensorType srcTy, Type elemLlvmTy,
-    ArrayRef<Value> srcVals, Value smemBase, ArrayRef<Value> dstStrides,
-    Location loc, RewriterBase &rewriter, const TargetInfoBase &target) {
+void storeDistributedToShared(MemDescType dstTy, RankedTensorType srcTy,
+                              Type elemLlvmTy, ArrayRef<Value> srcVals,
+                              Value smemBase, ArrayRef<Value> dstStrides,
+                              Location loc, RewriterBase &rewriter,
+                              const TargetInfoBase &target) {
   bool success = emitTransferBetweenRegistersAndShared(
       srcTy, dstTy, elemLlvmTy, /*maxVecElems=*/std::nullopt, smemBase,
       dstStrides, loc, rewriter, target, [&](VectorType vecTy, Value vecAddr) {
@@ -450,9 +419,37 @@ bool storeDistributedToSharedUsingLinearLayouts(
             .setAlignment(vecTy.getNumElements() *
                           elemLlvmTy.getIntOrFloatBitWidth() / 8);
       });
+  if (!success)
+    llvm::report_fatal_error("Failed to emit transfer from register to shared");
+}
 
-  assert(!success || srcVals.empty());
-  return success;
+SmallVector<SmallVector<unsigned>> emitOffsetForLayout(Attribute layout,
+                                                       RankedTensorType type) {
+  MLIRContext *ctx = layout.getContext();
+  auto shape = type.getShape();
+  unsigned rank = shape.size();
+
+  auto ll = triton::gpu::toLinearLayout(shape, layout);
+  if (!ll.has_value())
+    llvm::report_fatal_error("Unsupported layout");
+
+  StringAttr kRegister = str_attr("register");
+  StringAttr kLane = str_attr("lane");
+  StringAttr kWarp = str_attr("warp");
+  StringAttr kBlock = str_attr("block");
+
+  SmallVector<SmallVector<unsigned>> offsets;
+  for (int i = 0; i < ll->getInDimSize(str_attr("register")); i++) {
+    auto idxs =
+        ll->apply({{kRegister, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+    assert(idxs.size() == rank);
+    for (unsigned k = 0; k < rank; ++k) {
+      assert(idxs[k].first == str_attr("dim" + std::to_string(k)));
+    }
+    offsets.push_back(
+        llvm::to_vector_of<unsigned>(llvm::make_second_range(idxs)));
+  }
+  return offsets;
 }
 
 namespace LLVM {
@@ -518,6 +515,24 @@ Value createLLVMIntegerConstant(OpBuilder &builder, Location loc, short width,
   Type ty = builder.getIntegerType(width);
   return builder.create<LLVM::ConstantOp>(loc, ty,
                                           builder.getIntegerAttr(ty, value));
+}
+
+LLVM::CallOp createLLVMCallOp(OpBuilder &builder, Location loc,
+                              LLVMFuncOp funcOp, ValueRange args) {
+  auto op = builder.create<LLVM::CallOp>(loc, funcOp, args);
+  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
+  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
+  return op;
+}
+
+LLVM::CallIntrinsicOp
+createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
+                          TypeRange types, ValueRange args) {
+  auto op = builder.create<LLVM::CallIntrinsicOp>(loc, types, args);
+  op.getProperties().setIntrin(builder.getStringAttr(intrinsic));
+  op.getProperties().setOpBundleSizes(builder.getDenseI32ArrayAttr({}));
+  op.getProperties().setOperandSegmentSizes({static_cast<int>(args.size()), 0});
+  return op;
 }
 
 bool isConstantZero(Value v) {

@@ -13,6 +13,18 @@ def DecomposeUnsupportedAMDConversions : Pass<"decompose-unsupported-amd-convers
     ];
 }
 
+def OptimizeAMDLDSUsage : Pass<"optimize-amd-lds-usage", "mlir::ModuleOp"> {
+    let summary = "Minimize LDS usage";
+    let constructor = "mlir::triton::AMD::createOptimizeLDSUsagePass(\"\")";
+
+    let options = [
+        Option<"targetArch", "target-arch", "std::string", /*default*/"",
+               "gfx target device architecture, e.g., gfx942">,
+        Option<"customLDSLimit", "lds-limit", "int", /*default*/"0",
+               "custom limit of LDS consumption, if not provided, maximum LDS size is used">,
+    ];
+}
+
 def ConvertTritonAMDGPUToLLVM : Pass<"convert-triton-amdgpu-to-llvm", "mlir::ModuleOp"> {
     let summary = "Convert TritonGPU to LLVM";
     let constructor = "mlir::triton::createConvertTritonAMDGPUToLLVMPass(\"\", /*ftz=*/true)";
@@ -42,5 +54,25 @@ def ConvertBuiltinFuncToLLVM : Pass<"convert-builtin-func-to-llvm", "mlir::Modul
     let dependentDialects = ["mlir::LLVM::LLVMDialect"];
 
 }
+
+def InsertInstructionSchedHints : Pass<"insert-instruction-sched-hints", "mlir::ModuleOp"> {
+    let summary = "Insert instruction scheduling hints after the dot ops in the main loop";
+    let constructor = "mlir::triton::createInsertInstructionSchedHintsPass()";
+
+    let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+}
+
+def LowerInstructionSchedHints : Pass<"lower-insert-instruction-sched-hints", "mlir::ModuleOp"> {
+    let summary = "Lower instruction scheduling hints to LLVM intrinsics";
+    let constructor = "mlir::triton::createLowerInstructionSchedHintsPass(\"\")";
+
+    let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+
+    let options = [
+        Option<"variant", "variant", "std::string", /*default*/"\"default\"",
+               "instruction scheduling variant">,
+    ];
+}
+
 
 #endif

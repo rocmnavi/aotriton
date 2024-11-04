@@ -37,6 +37,9 @@ public:
                        pred);
   }
 
+  virtual void storeMatrixShared(RewriterBase &rewriter, Location loc,
+                                 Value ptr, Value val) const = 0;
+
   virtual Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                            int i) const = 0;
   virtual Value shuffleUp(RewriterBase &rewriter, Location loc, Value val,
@@ -54,13 +57,6 @@ public:
                           unsigned numLaneToReduce,
                           unsigned interleave) const = 0;
 
-  virtual bool processReplicaUsingStMatrix(
-      RewriterBase &rewriter, Location loc, Value smemBase,
-      SmallVector<Value> &vals, RankedTensorType srcTy, Type elemTy,
-      ArrayRef<unsigned> paddedRepShape, ArrayRef<unsigned> origRepShape,
-      ArrayRef<unsigned> outOrd, unsigned accumNumReplicates,
-      int swizzleByteWidth = 0) const = 0;
-
   virtual std::string getMulhiFuncName(Type resultElementTy) const = 0;
   // Emits LLVM code with |rewriter| to print a message following the given
   // format from the device. |formatStrStart| is the pointer to the start of
@@ -68,11 +64,23 @@ public:
   // placeholders in the format string.
   virtual void printf(RewriterBase &rewriter, Value formatStrStart,
                       int formatStrByteCount, ValueRange args) const = 0;
+
+  // Emits LLVM code with |rewriter| to print a message, particularly useful for
+  // backend debug. |msg| is the message to print, |args| are the arguments to
+  // fill placeholders in the |msg|.
+  // NOTE: This function is used for backend debug. DO NOT DELETE.
+  // Example use: targetInfo.printf(rewriter,"index: %d, value: %f", {index,
+  // value});
+  virtual void printf(RewriterBase &rewriter, StringRef msg,
+                      ValueRange args) const = 0;
+
   // Emits LLVM code with |rewriter| to perform assertion failure with the given
   // |message| from the given |func| in |file|.
   virtual void assertFail(RewriterBase &rewriter, Location loc,
                           StringRef message, StringRef file, StringRef func,
                           int line) const = 0;
+
+  virtual int getSharedAddressSpace() const = 0;
 
   virtual ~TargetInfoBase() {}
 };

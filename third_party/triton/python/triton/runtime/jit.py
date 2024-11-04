@@ -230,10 +230,12 @@ def _normalize_ty(ty) -> str:
 class KernelParam:
     """Represents a parameter (name plus metadata) to a @jit'ed function."""
 
-    def __init__(self, num: int, param: inspect.Parameter, do_not_specialize: bool):
+    def __init__(self, num: int, param: inspect.Parameter, do_not_specialize: bool,
+                 do_not_specialize_on_alignment: bool):
         self.num = num
         self._param = param
         self.do_not_specialize = do_not_specialize
+        self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
 
     @cached_property
     def name(self):
@@ -273,13 +275,13 @@ class KernelParam:
         return self._param.default != inspect.Parameter.empty
 
 
-def compute_spec_key(v):
+def compute_spec_key(v, align):
 
-    if hasattr(v, "data_ptr") and (v.data_ptr() % 16 == 0):
+    if align and hasattr(v, "data_ptr") and (v.data_ptr() % 16 == 0):
         return "D"
     elif isinstance(v, int):
         # bool is a subclass of int, so we don't check explicitly above.
-        if (v % 16 == 0):
+        if align and (v % 16 == 0):
             return "D"
         elif v == 1:
             return "1"
@@ -304,6 +306,8 @@ def mangle_type(arg, is_const=False):
             return "i64"
     elif isinstance(arg, float):
         return "fp32"
+    elif hasattr(arg, "tma_desc_cpu_ptr"):
+        return "nvTmaDesc"
     else:
         # dtypes are hashable so we can memoize this mapping:
         dsk = (arg.dtype, is_const)
@@ -338,7 +342,7 @@ def serialize_specialization_data(name, signature, constants, attrs, options, ke
     return serialized_obj
 
 
-def create_function_from_signature(sig, kparams):
+def create_function_from_signature(sig, kparams, backend):
     """
     Equivalent to sig.bind followed by apply_defaults. This generates a
     native Python function (using exec) which can be memoized on a per-kernel
@@ -368,7 +372,10 @@ def create_function_from_signature(sig, kparams):
         else:
             non_constexpr_vals.append(name)
             if not kp.do_not_specialize:
-                specialisations.append('compute_spec_key(%s)' % name)
+                if not kp.do_not_specialize_on_alignment:
+                    specialisations.append('compute_spec_key(%s, align=True)' % name)
+                else:
+                    specialisations.append('compute_spec_key(%s, align=False)' % name)
             if kp.annotation_type:
                 signature_types.append('"%s"' % kp.annotation_type)
             else:
@@ -394,7 +401,7 @@ def create_function_from_signature(sig, kparams):
     }
 
     func_namespace['mangle_type'] = mangle_type
-    func_namespace['compute_spec_key'] = compute_spec_key
+    func_namespace['compute_spec_key'] = backend.compute_spec_key
 
     # Execute the function string in func_namespace to create the function
     exec(func_body, func_namespace)
@@ -435,7 +442,9 @@ for v in list(type_canonicalisation_dict.values()):
 class JITFunction(KernelInterface[T]):
     # Hook for inspecting compiled functions and modules
     cache_hook = None
-    divisibility = 16
+    # Hook to signal that a kernel is done compiling and inspect compiled function.
+    # cache_hook will always be called before compilation and compiled_hook after.
+    compiled_hook = None
 
     @staticmethod
     def _key_of(arg):
@@ -456,42 +465,6 @@ class JITFunction(KernelInterface[T]):
             return None
         else:
             raise TypeError(f"Unsupported type {type(arg)} for {arg}")
-
-    @staticmethod
-    def _spec_of(arg):
-        if hasattr(arg, "data_ptr"):
-            return arg.data_ptr() % JITFunction.divisibility == 0
-        elif isinstance(arg, int):
-            return (arg % 16 == 0, arg == 1)
-        return (arg is None, )
-
-    def _get_config(self, *args):
-        from ..compiler import AttrsDescriptor
-
-        def is_divisible_by_16(x):
-            if hasattr(x, "data_ptr"):
-                return x.data_ptr() % JITFunction.divisibility == 0
-            elif isinstance(x, int):
-                return x % JITFunction.divisibility == 0
-            if x is None:
-                return True
-            return False
-
-        divisible_by_16 = {
-            param.num
-            for param, arg in zip(self.params, args)
-            if is_divisible_by_16(arg) and not param.do_not_specialize
-        }
-        equal_to_1 = {
-            param.num
-            for param, arg in zip(self.params, args)
-            if isinstance(arg, int) and not isinstance(arg, bool) and arg == 1 and not param.do_not_specialize
-        }
-        # folded equal_to_1 and None
-        # TODO: method to collect all folded args
-        return AttrsDescriptor(tuple(divisible_by_16), tuple(equal_to_1))
-        # return _triton.code_gen.instance_descriptor(divisible_by_16,
-        # equal_to_1)
 
     @staticmethod
     def _type_of(key, is_const=False):
@@ -518,8 +491,11 @@ class JITFunction(KernelInterface[T]):
         constants,
         options,
         configs,
+        is_warmup,
+        before,
     ):
-        if JITFunction.cache_hook is None:
+        hook = JITFunction.cache_hook if before else JITFunction.compiled_hook
+        if hook is None:
             return False
 
         name = self.fn.__name__
@@ -548,14 +524,15 @@ class JITFunction(KernelInterface[T]):
             'extern_libs': options.extern_libs,
             'configs': configs,
             'specialization_data': specialization_data,
+            'is_warmup': is_warmup,
         }
 
-        return JITFunction.cache_hook(
+        return hook(
             key=key,
             repr=repr,
             fn=JitFunctionInfo(module, name, self),
             compile={"key": key, **kwargs},
-            is_manual_warmup=False,
+            is_manual_warmup=is_warmup,
             already_compiled=False,
         )
 
@@ -567,7 +544,7 @@ class JITFunction(KernelInterface[T]):
         assert callable(hook)
         self.pre_run_hooks.append(hook)
 
-    def create_binder(self):
+    def create_binder(self, backend):
         """
         Precompute as much as possible.
         """
@@ -576,7 +553,7 @@ class JITFunction(KernelInterface[T]):
         self.compile = compile
         self.ASTSource = ASTSource
         self.make_backend = make_backend
-        self.binder = create_function_from_signature(self.signature, self.params)
+        self.binder = create_function_from_signature(self.signature, self.params, backend)
         self.constexpr_indices = [i for (i, p) in enumerate(self.params) if p.is_constexpr]
         self.non_constexpr_indices = [i for (i, p) in enumerate(self.params) if not p.is_constexpr]
         self.specialised_indices = [
@@ -584,17 +561,21 @@ class JITFunction(KernelInterface[T]):
         ]
 
     def run(self, *args, grid, warmup, **kwargs):
+        kwargs["debug"] = kwargs.get("debug", False) or os.environ.get("TRITON_DEBUG", "0") == "1"
+
         # parse options
+        from ..compiler import make_backend
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
-        kwargs["debug"] = self.debug
+        target = driver.active.get_current_target()
+        backend = make_backend(target)
 
         # Execute pre run hooks with args and kwargs
         for hook in self.pre_run_hooks:
             hook(*args, **kwargs)
 
         if self.binder is None:
-            self.create_binder()
+            self.create_binder(backend)
 
         bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
 
@@ -604,8 +585,6 @@ class JITFunction(KernelInterface[T]):
 
         if kernel is None:
             # Kernel is not cached; we have to compile.
-            target = driver.active.get_current_target()
-            backend = self.make_backend(target)
             options = backend.parse_options(kwargs)
 
             # deprecated arguments
@@ -626,17 +605,18 @@ class JITFunction(KernelInterface[T]):
             sigvals = sig_and_spec[:len(sigkeys)]
             signature = {k: ('*i8' if (v == 'none') else v) for (k, v) in zip(sigkeys, sigvals)}
 
-            configs = (self._get_config(*bound_vals), )
+            configs = (backend.get_attrs_descriptor(self.params, bound_vals), )
+            constant_params = configs[0].get_constants()
             constants = {
                 p.name: v
                 for (v, p) in zip(bound_vals, self.params)
-                if p.is_constexpr or p.num in configs[0].equal_to_1 or v is None
+                if p.is_constexpr or (p.num in constant_params) or v is None
             }
             for i, arg in constants.items():
                 if callable(arg):
                     raise TypeError(f"Callable constexpr at index {i} is not supported")
 
-            if self._call_hook(key, signature, device, constants, options, configs):
+            if self._call_hook(key, signature, device, constants, options, configs, warmup, before=True):
                 return None
             # compile the kernel
             src = self.ASTSource(self, signature, constants, configs[0])
@@ -646,6 +626,7 @@ class JITFunction(KernelInterface[T]):
                 options=options.__dict__,
             )
             self.cache[device][key] = kernel
+            self._call_hook(key, signature, device, constants, options, configs, warmup, before=False)
 
         # Check that used global values have not changed.
         not_present = object()
@@ -673,15 +654,17 @@ class JITFunction(KernelInterface[T]):
                        self.CompiledKernel.launch_enter_hook, self.CompiledKernel.launch_exit_hook, *non_constexpr_vals)
         return kernel
 
-    def __init__(self, fn, version=None, do_not_specialize=None, debug=None, noinline=None, repr=None,
-                 launch_metadata=None):
+    def __init__(self, fn, version=None, do_not_specialize=None, do_not_specialize_on_alignment=None, debug=None,
+                 noinline=None, repr=None, launch_metadata=None):
         do_not_specialize = do_not_specialize if do_not_specialize else []
+        do_not_specialize_on_alignment = do_not_specialize_on_alignment if do_not_specialize_on_alignment else []
 
         self.fn = fn
         self.module = fn.__module__
         self.version = version
         self.signature = inspect.signature(fn)
         self.do_not_specialize = do_not_specialize
+        self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
         self.starting_line_number = inspect.getsourcelines(fn)[1]
         self.repr = lambda _: fn.__name__ if repr is None else repr(_)
         self.launch_metadata = launch_metadata
@@ -690,8 +673,9 @@ class JITFunction(KernelInterface[T]):
 
         self.params = []
         for i, param in enumerate(self.signature.parameters.values()):
-            dns = do_not_specialize and (i in do_not_specialize or param.name in do_not_specialize)
-            self.params.append(KernelParam(i, param, dns))
+            dns = i in do_not_specialize or param.name in do_not_specialize
+            dns_oa = i in do_not_specialize_on_alignment or param.name in do_not_specialize_on_alignment
+            self.params.append(KernelParam(i, param, dns, dns_oa))
 
         # function source code (without decorators)
         self.src = textwrap.dedent(inspect.getsource(fn))
@@ -714,7 +698,6 @@ class JITFunction(KernelInterface[T]):
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__
         self.kernel = None
-        self.debug = True if os.environ.get("TRITON_DEBUG", "0") == "1" else debug
         self.noinline = noinline
 
         # TODO(jlebar): Remove uses of these fields outside this file, then
@@ -745,7 +728,8 @@ class JITFunction(KernelInterface[T]):
         return self.run(grid=grid, warmup=True, *map(MockTensor.wrap_dtype, args), **kwargs)
 
     def preload(self, specialization_data):
-        from ..compiler import AttrsDescriptor, compile, ASTSource
+        from ..compiler import compile, ASTSource
+        from triton.backends.compiler import AttrsDescriptor
         import json
         import triton.language as tl
         device = driver.active.get_current_device()
@@ -809,6 +793,7 @@ def jit(
     repr: Optional[Callable] = None,
     launch_metadata: Optional[Callable] = None,
     do_not_specialize: Optional[Iterable[int]] = None,
+    do_not_specialize_on_alignment: Optional[Iterable[int]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
 ) -> Callable[[T], JITFunction[T]]:
@@ -822,6 +807,7 @@ def jit(
     repr: Optional[Callable] = None,
     launch_metadata: Optional[Callable] = None,
     do_not_specialize: Optional[Iterable[int]] = None,
+    do_not_specialize_on_alignment: Optional[Iterable[int]] = None,
     debug: Optional[bool] = None,
     noinline: Optional[bool] = None,
 ) -> Union[JITFunction[T], Callable[[T], JITFunction[T]]]:
@@ -847,13 +833,15 @@ def jit(
         assert callable(fn)
         if os.getenv("TRITON_INTERPRET", "0") == "1":
             from .interpreter import InterpretedFunction
-            return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize, debug=debug,
+            return InterpretedFunction(fn, version=version, do_not_specialize=do_not_specialize,
+                                       do_not_specialize_on_alignment=do_not_specialize_on_alignment, debug=debug,
                                        noinline=noinline, repr=repr, launch_metadata=launch_metadata)
         else:
             return JITFunction(
                 fn,
                 version=version,
                 do_not_specialize=do_not_specialize,
+                do_not_specialize_on_alignment=do_not_specialize_on_alignment,
                 debug=debug,
                 noinline=noinline,
                 repr=repr,
@@ -891,6 +879,10 @@ class MockTensor:
     def data_ptr():
         return 0  # optimistically assumes multiple of 16
 
+    @staticmethod
+    def ptr_range():
+        return 0  # optimistically assumes 32 bit pointer range
+
 
 class TensorWrapper:
 
@@ -918,6 +910,9 @@ class TensorWrapper:
 
     def copy_(self, other):
         self.base.copy_(other.base)
+
+    def clone(self):
+        return TensorWrapper(self.base.clone(), self.dtype)
 
     def to(self, device):
         return TensorWrapper(self.base.to(device), self.dtype)

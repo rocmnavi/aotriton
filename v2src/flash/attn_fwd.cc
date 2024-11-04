@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+#include <aotriton/config.h>
 #include <aotriton/_internal/util.h>
 #include <aotriton/flash.h>
 #include <aotriton/util.h>
@@ -13,7 +14,7 @@
 #define AOTRITON_VERBOSE 1
 #endif
 
-namespace aotriton::v2::flash {
+namespace AOTRITON_NS::v2::flash {
 
 hipError_t
 _attn_fwd_common(T4 q,
@@ -29,11 +30,14 @@ _attn_fwd_common(T4 q,
                  T2 softmax_lse,
                  T4 out,
                  float dropout_p,
-                 uint64_t philox_seed,
-                 uint64_t philox_offset,
+                 T0 philox_seed,
+                 T0 philox_offset1,
+                 int64_t philox_offset2,
+                 T0 philox_seed_output,
+                 T0 philox_offset_output,
                  T4 encoded_softmax,
                  bool is_causal,
-                 aotriton::Stream stream_wrap,
+                 AOTRITON_NS::Stream stream_wrap,
                  FwdExtraArguments* extargs) {
   hipError_t err;
   auto stream = stream_wrap.native();
@@ -45,7 +49,7 @@ _attn_fwd_common(T4 q,
               << " pre_load_v = " << params.pre_load_v << std::endl;
 #endif
     dim3 grid {
-      aotriton::cdiv<uint32_t>(params.max_seqlen_q, params.BLOCK_M),
+      AOTRITON_NS::cdiv<uint32_t>(params.max_seqlen_q, params.BLOCK_M),
       uint32_t(params.Q->size(1)),
       params.num_seqlens == 0 ? uint32_t(params.Q->size(0)) : params.num_seqlens,
     };
@@ -57,7 +61,7 @@ _attn_fwd_common(T4 q,
   int head_size = q.size(3);
   int num_head_q = q.size(1);
   int num_head_k = k.size(1);
-  int head_dim_rounded = std::max<int>(16, aotriton::bit_ceil(head_size));
+  int head_dim_rounded = std::max<int>(16, AOTRITON_NS::bit_ceil(head_size));
   int bias_type = 0;
   if (b) {
     bias_type = 1;
@@ -81,8 +85,11 @@ _attn_fwd_common(T4 q,
     .cu_seqlens_k = &cu_seqlens_k,
     .head_dim = static_cast<int32_t>(head_size),
     .dropout_p = dropout_p,
-    .philox_seed = philox_seed,
-    .philox_offset_base = static_cast<uint32_t>(philox_offset),
+    .philox_seed_ptr = &philox_seed,
+    .philox_offset1 = &philox_offset1,
+    .philox_offset2 = static_cast<uint32_t>(philox_offset2),
+    .philox_seed_output = &philox_seed_output,
+    .philox_offset_output = &philox_offset_output,
     .CAUSAL = is_causal,
     .BLOCK_DMODEL = head_dim_rounded,
     .ENABLE_DROPOUT = dropout_p > 0.0,
@@ -124,11 +131,14 @@ attn_fwd(T4 q,
          T2 softmax_lse,
          T4 out,
          float dropout_p,
-         uint64_t philox_seed,
-         uint64_t philox_offset,
+         T0 philox_seed,
+         T0 philox_offset1,
+         int64_t philox_offset2,
+         T0 philox_seed_output,
+         T0 philox_offset_output,
          T4 encoded_softmax,
          bool is_causal,
-         aotriton::Stream stream_wrap,
+         AOTRITON_NS::Stream stream_wrap,
          FwdExtraArguments* extargs) {
   auto null_t1 = T1::get_null_tensor(DType::kInt32);
   return _attn_fwd_common(q,
@@ -145,7 +155,10 @@ attn_fwd(T4 q,
                           out,
                           dropout_p,
                           philox_seed,
-                          philox_offset,
+                          philox_offset1,
+                          philox_offset2,
+                          philox_seed_output,
+                          philox_offset_output,
                           encoded_softmax,
                           is_causal,
                           stream_wrap,
@@ -165,11 +178,14 @@ attn_fwd_compact_varlen(T4 q,            // 1 x num_heads x total_q x head_size,
                         T2 softmax_lse,
                         T4 out, // 1 x num_heads x total_q x head_size
                         float dropout_p,
-                        uint64_t philox_seed,
-                        uint64_t philox_offset,
+                        T0 philox_seed,
+                        T0 philox_offset1,
+                        int64_t philox_offset2,
+                        T0 philox_seed_output,
+                        T0 philox_offset_output,
                         T4 encoded_softmax,
                         bool is_causal,
-                        aotriton::Stream stream_wrap,
+                        AOTRITON_NS::Stream stream_wrap,
                         FwdExtraArguments* extargs) {
   return _attn_fwd_common(q,
                           k,
@@ -185,7 +201,10 @@ attn_fwd_compact_varlen(T4 q,            // 1 x num_heads x total_q x head_size,
                           out,
                           dropout_p,
                           philox_seed,
-                          philox_offset,
+                          philox_offset1,
+                          philox_offset2,
+                          philox_seed_output,
+                          philox_offset_output,
                           encoded_softmax,
                           is_causal,
                           stream_wrap,

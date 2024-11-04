@@ -69,12 +69,9 @@ Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
 
 Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                          Value cmp) const {
-  auto stringAttr = rewriter.getStringAttr("llvm.amdgcn.ballot");
-  SmallVector<Value> operands = {cmp};
-  Value asmResult =
-      rewriter.create<LLVM::CallIntrinsicOp>(loc, type, stringAttr, operands)
-          ->getResult(0);
-  return asmResult;
+  return LLVM::createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.ballot",
+                                         type, cmp)
+      ->getResult(0);
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
@@ -87,6 +84,11 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   mlir::LLVM::AMD::llStore(rewriter, loc, ptr, val, pred);
 }
 
+void TargetInfo::storeMatrixShared(RewriterBase &rewriter, Location loc,
+                                   Value ptr, Value val) const {
+  llvm::report_fatal_error("AMDGPU does not support stmatrix");
+}
+
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
                               std::optional<Value> ctaId, Type elemTy,
                               Value pred) const {
@@ -94,7 +96,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
   }
-  Value falseVal = rewriter.create<arith::ConstantOp>(
+  Value falseVal = rewriter.create<LLVM::ConstantOp>(
       loc, elemTy, rewriter.getZeroAttr(elemTy));
   return mlir::LLVM::AMD::llLoad(rewriter, loc, ptr, elemTy, pred, falseVal);
 }
@@ -128,15 +130,6 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
                             SmallVector<Value> &acc, triton::ReduceOp op,
                             unsigned numLaneToReduce,
                             unsigned interleave) const {
-  return false;
-}
-
-bool TargetInfo::processReplicaUsingStMatrix(
-    RewriterBase &rewriter, Location loc, Value smemBase,
-    SmallVector<Value> &vals, RankedTensorType srcTy, Type elemTy,
-    ArrayRef<unsigned> paddedRepShape, ArrayRef<unsigned> origRepShape,
-    ArrayRef<unsigned> outOrd, unsigned accumNumReplicates,
-    int swizzleByteWidth) const {
   return false;
 }
 
@@ -218,6 +211,18 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
                     /*useStdError=*/false);
 }
 
+void TargetInfo::printf(RewriterBase &rewriter, StringRef msg,
+                        ValueRange args) const {
+  assert(!msg.empty() && "printf with empty string not supported");
+  llvm::SmallString<64> msgNewline(msg);
+  msgNewline.push_back('\n');
+  msgNewline.push_back('\0');
+  Value msgValue =
+      LLVM::addStringToModule(UnknownLoc::get(rewriter.getContext()), rewriter,
+                              "printfFormat_", msgNewline);
+  printf(rewriter, msgValue, msgNewline.size_in_bytes(), args);
+}
+
 void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
                             StringRef message, StringRef file, StringRef func,
                             int line) const {
@@ -231,8 +236,13 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
   printfImpl(msgValue, msgBuffer.size_in_bytes(), /*args=*/ValueRange(),
              rewriter, /*useStdError=*/true);
 
+  // Set block barrrier before aborting kernel, give a chance for all
+  // the threads in a block to check/print the assert failure.
+  barrier();
   // Perform the trap to abort the kernel.
   rewriter.create<LLVM::Trap>(loc);
 }
+
+int TargetInfo::getSharedAddressSpace() const { return 3; }
 
 } // namespace mlir::triton::AMD
