@@ -5,11 +5,12 @@ import triton
 import triton.language as tl
 from dropout import dropout_mask, dropout_rng, dropout_offsets
 from masked_load_store import load_fn, mstore2d
+from triton.language.extra import libdevice
 
 @triton.jit
 def attn_fwd_inner(
         # Problem Description
-        acc, l_i, m_i,
+        acc, l_i, m_i, qk_scale, bias_scale,
         q, k_ptrs, v_ptrs, bias_ptrs,
         stride_kn, stride_vk, stride_bn,
         seqlen_q, seqlen_k, head_dim,
@@ -75,14 +76,14 @@ def attn_fwd_inner(
             causal_mask = offs_m[:, None] >= causal_boundary[None, :]
             qk = tl.where(causal_mask, qk, float("-inf"))
         # -- compute qk ----
-        qk += tl.dot(q, k)
+        qk += tl.dot(q, k) * qk_scale
         if bias_ptrs is not None:
             bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
             bias = load_fn(bias_ptrs, offs_m, bias_offs_n, seqlen_q, seqlen_k)
             # While bias is added after multiplying qk with sm_scale,
             # our optimization to use 2^x instead of e^x results in an additional
             # scale factor of log2(e) which we must also multiply the bias with.
-            qk += (bias * 1.44269504089)
+            qk += bias * 1.44269504089
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -90,12 +91,21 @@ def attn_fwd_inner(
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
             alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, global_m_positions,
                                               global_n_positions)
-            qk += (alibi_block * 1.44269504089)  # scale factor of log2(e)
+            qk += alibi_block * 1.44269504089
 
-        # softmax
+        # This has softmax approach has numerical errors for large inputs:
+        # See: https://github.com/ROCm/aotriton/issues/54
+        # m_ij = tl.maximum(m_i, qk_scale * tl.max(qk, 1))
+        # p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
-        p = tl.math.exp2(qk)
+        p = tl.math.exp2(qk_scale * (qk - m_ij[:, None]))
+        p = tl.math.exp2(qk - m_ij[:, None])
+
+        # When sm_scale = 0.0 and MASK_STEPS/CAUSAL = True
+        # qk * qk_scale = -inf * 0.0 = nan
+        if MASK_STEPS or CAUSAL:
+            if qk_scale == 0.0:
+                p = tl.where(libdevice.isnan(p), 0.0, p)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)

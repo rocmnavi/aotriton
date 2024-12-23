@@ -40,8 +40,11 @@ def attn_fwd(
         max_seqlen_k : 'i32',
         head_dim : 'i32',
         dropout_p,
-        philox_seed,
-        philox_offset_base,
+        philox_seed_ptr,
+        philox_offset1 : '*u32',
+        philox_offset2 : 'i32',
+        philox_seed_output : '*u64',
+        philox_offset_output : '*u64',
         encoded_softmax,
         CAUSAL: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -65,6 +68,17 @@ def attn_fwd(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
+    philox_seed = 0
+    philox_offset_base = philox_offset2
+    if ENABLE_DROPOUT:
+        philox_seed = tl.load(philox_seed_ptr)
+        philox_offset_base += tl.load(philox_offset1)
+        if (tl.program_id(0) == 0 and tl.program_id(1) == 0) and tl.program_id(2) == 0:
+            if philox_seed_output.cast(dtype=tl.uint64, bitcast=True) != 0:
+                tl.store(philox_seed_output, philox_seed)
+            if philox_offset_output.cast(dtype=tl.uint64, bitcast=True) != 0:
+                tl.store(philox_offset_output,
+                         philox_offset_base.to(dtype=philox_seed_output.type.element_ty))
     if num_seqlens > 0:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
         cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
@@ -173,7 +187,7 @@ def attn_fwd(
     else:
         alibi_slope = None
 
-    off_zh = batch_index * num_head_q + off_h_q
+    off_zh = off_z * num_head_q + off_h_q
     if ENABLE_DROPOUT:
         batch_philox_offset = philox_offset_base + off_zh * max_seqlen_q * max_seqlen_k
     else:
@@ -193,12 +207,12 @@ def attn_fwd(
     # scale sm_scale by log_2(e) and use 2^x in the loop as we do not
     # have native e^x support in HW.
     qk_scale = sm_scale * 1.44269504089
+    bias_scale = 1.0 / sm_scale  # TODO: legacy code to remove
     # Q is loaded once at the beginning and shared by all N blocks.
     q_ptrs_mask = offs_m[:, None] < seqlen_q
     if PADDED_HEAD:
         q_ptrs_mask = q_ptrs_mask & (offs_d[None, :] < head_dim)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
-    q = (q * qk_scale).to(q.type.element_ty)
 
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
@@ -221,7 +235,7 @@ def attn_fwd(
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
         acc, l_i, m_i = attn_fwd_inner(
-                acc, l_i, m_i,
+                acc, l_i, m_i, qk_scale, bias_scale,
                 q, k_ptrs, v_ptrs, bias_ptrs,
                 stride_kn, stride_vk, stride_bn,
                 seqlen_q, seqlen_k, head_dim,
@@ -257,7 +271,7 @@ def attn_fwd(
         #     encoded_sm_base += n_full_blocks * BLOCK_N
             # encoded_sm_ptrs += n_full_blocks * BLOCK_N
         acc, l_i, m_i = attn_fwd_inner(
-                acc, l_i, m_i,
+                acc, l_i, m_i, qk_scale, bias_scale,
                 q, k_ptrs, v_ptrs, bias_ptrs,
                 stride_kn, stride_vk, stride_bn,
                 seqlen_q, seqlen_k, head_dim,

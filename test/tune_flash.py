@@ -67,7 +67,11 @@ class FlashSourceMonad(Monad):
 class FlashTunerSource(MonadService):
     def gen(self):
         a = self._args
-        yield from itertools.product(a.batch, a.n_heads, a.d_head, a.seqlen_q, a.seqlen_k, a.causal, a.sm_scale, a.dropout_p, a.return_encoded_softmax, a.dtype, a.bias_type)
+        for tup in itertools.product(a.batch, a.n_heads, a.d_head, a.seqlen_q, a.seqlen_k, a.causal, a.sm_scale, a.dropout_p, a.return_encoded_softmax, a.dtype, a.bias_type):
+            BATCH, N_HEADS, D_HEAD, seqlen_q, seqlen_k, causal, sm_scale, dropout_p, return_encoded_softmax, dtype, bias_type = tup
+            if seqlen_q > 4096 and seqlen_k > 4096:
+                BATCH = 2
+            yield (BATCH, N_HEADS, D_HEAD, seqlen_q, seqlen_k, causal, sm_scale, dropout_p, return_encoded_softmax, dtype, bias_type)
 
     def init(self, _):
         pass
@@ -76,9 +80,12 @@ class FlashTunerSource(MonadService):
         return isinstance(timing, list) and len(timing) == 3
 
     def is_inf_time(self, timing):
-        return isinstance(timing, float) and math.isinf(timing)
+        return timing is None or isinstance(timing, float) and math.isinf(timing)
 
     def update_continue_dict(self, j, cd):
+        result = j['result']
+        if result == 'skipped':
+            return
         kn = j['kernel_name']
         kig = j['_debug_kernel_index']
         kit = j['_debug_total_number_of_kernels']
@@ -135,6 +142,7 @@ class FlashTunerSource(MonadService):
 
         for i, tup in enumerate(self.gen()):
             self.print(f"[{i:06d}] gen_itup {tup}")
+            batch, n_heads, d_head, seqlen_q, seqlen_k = tup[:5]
             if a.selective_set:
                 if i in a.selective_set:
                     payload = TuningResult(tup=tup, kig_dict=self.create_kig_dict())
@@ -145,6 +153,8 @@ class FlashTunerSource(MonadService):
             if a.continue_from is not None and i < a.continue_from:
                 continue
             if i in skip_set:
+                continue
+            if seqlen_q > a.max_seqlen_q or seqlen_k > a.max_seqlen_k:
                 continue
             if a.stop_at is not None and i > a.stop_at:
                 break
@@ -221,7 +231,7 @@ def make_ui(manager : TunerManager):
 
 def parse():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument('--batch', type=int, nargs=1, default=[1], help='(Not a functional) Batch size.')
+    p.add_argument('--batch', type=int, nargs=1, default=[8], help='(Not a functional) Batch size.')
     p.add_argument('--n_heads', type=int, nargs=1, default=[12], help='(Not a functional) Number of heads')
     p.add_argument('--sm_scale', type=float, nargs=1, default=[1.2], help='(Not a functional) Softmax Scale')
     p.add_argument('--return_encoded_softmax', type=bool, default=[False],
@@ -231,6 +241,8 @@ def parse():
     # p.add_argument('--seqlen_k', type=int, nargs='+', default=[4,8,16,32,64,128,256,1024,2048,4096,8192], help='Sequence length of K/V.')
     p.add_argument('--seqlen_q', type=int, nargs='+', default=[4,8,16,32,64,128,256,512,1024,2048,4096,8192], help='Sequence length of Q.')
     p.add_argument('--seqlen_k', type=int, nargs='+', default=[4,8,16,32,64,128,256,512,1024,2048,4096,8192], help='Sequence length of K/V.')
+    p.add_argument('--max_seqlen_q', type=int, default=8192, help='A neat way to limit max value of --seqlen_q.')
+    p.add_argument('--max_seqlen_k', type=int, default=8192, help='A neat way to limit max value of --seqlen_k.')
     p.add_argument('--causal', type=int, nargs='+', default=[True,False], choices=[0, 1], help='Causal mask. (Use 0/1 for False/True')
     p.add_argument('--dropout_p', type=float, nargs='+', default=[0.5, 0.0], help='Probablity to dropout (0 to disable).')
     p.add_argument('--dtype', type=str, nargs='+',
@@ -267,6 +279,7 @@ def parse():
                            This option allow skipping next kernel relative to json record,
                            which are usually the faulty kernel.'''
                   )
+    p.add_argument('--debug_headless', action='store_true', help='Set headless mode for textual.App.')
     args = p.parse_args()
     assert args.return_encoded_softmax == [False], ('Do not support tuning return_encoded_softmax=True. '
             'RETURN_ENCODED_SOFTMAX will be removed in the future and debug_fill_dropout_rng will be preferred choice.')
@@ -294,7 +307,7 @@ def main():
     tuner.launch_graph()
     # monitor_thread = Thread(target=tuner.monitor)
     # monitor_thread.start()
-    app.run(mouse=False, inline=True)
+    app.run(mouse=False, inline=True, headless=args.debug_headless)
     # monitor_thread.join()
 
 if __name__ == '__main__':
