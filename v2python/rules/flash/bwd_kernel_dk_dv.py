@@ -24,6 +24,8 @@ class bwd_kernel_dk_dv(FlashKernel):
         'stride_oz', 'stride_oh', 'stride_om', 'stride_ok',
         'stride_dkz', 'stride_dkh', 'stride_dkn', 'stride_dkk',
         'stride_dvz', 'stride_dvh', 'stride_dvk', 'stride_dvn',
+        'num_head_q',
+        'num_head_k',
         'cu_seqlens_q',
         'cu_seqlens_k',
         'num_seqlens',
@@ -31,8 +33,9 @@ class bwd_kernel_dk_dv(FlashKernel):
         'max_seqlen_k',
         'head_dim',
         'dropout_p',
-        'philox_seed',
-        'philox_offset_base',
+        'philox_seed_ptr',
+        'philox_offset1',
+        'philox_offset2',
         'BLOCK_M', # tl.constexpr starts here
         'BLOCK_DMODEL',
         'BLOCK_N',
@@ -57,6 +60,8 @@ class bwd_kernel_dk_dv(FlashKernel):
         'D': 2,
         'cu_seqlens_q': 1,
         'cu_seqlens_k': 1,
+        'philox_seed_ptr': 0,
+        'philox_offset1': 0,
     }
     TYPE_CHOICES = {
         frozenset(['Q', 'K', 'V', 'B', 'Out', 'DO', 'DK', 'DV']) : match_fwd('Q'),
@@ -64,13 +69,14 @@ class bwd_kernel_dk_dv(FlashKernel):
         frozenset(['L', 'D']) : ['*fp32:16'],
         frozenset(['cu_seqlens_q', 'cu_seqlens_k']) : match_fwd('cu_seqlens_q'),
         frozenset(['num_seqlens', 'max_seqlen_q', 'max_seqlen_k']) : match_fwd('num_seqlens'),
-        frozenset(['head_dim']) : ['i32'],
+        frozenset(['head_dim', 'num_head_q', 'num_head_k']) : ['i32'],
         frozenset(['dropout_p']) : match_fwd('dropout_p'),
-        frozenset(['philox_seed']) : match_fwd('philox_seed'),
-        frozenset(['philox_offset_base']) : match_fwd('philox_offset_base'),
+        frozenset(['philox_seed_ptr']) : match_fwd('philox_seed_ptr'),
+        frozenset(['philox_offset1']) : match_fwd('philox_offset1'),
+        frozenset(['philox_offset2']) : match_fwd('philox_offset2'),
     }
     FEAT_CHOICES = {
-        frozenset(['BLOCK_DMODEL']) : [16, 32, 64, 128, 256],
+        frozenset(['BLOCK_DMODEL']) : [16, 32, 64, 128, 256, 512],
         frozenset(['CAUSAL']) : [True, False],
         frozenset(['ENABLE_DROPOUT']) : match_fwd('ENABLE_DROPOUT'),
         frozenset(['PADDED_HEAD']) : [False, True],
@@ -90,20 +96,24 @@ class bwd_kernel_dk_dv(FlashKernel):
         'max_seqlen_q' : BinningLessOrEqual,
         'max_seqlen_k' : BinningLessOrEqual,
     }
-    PARTIALLY_TUNED_FUNCTIONALS = [('PADDED_HEAD', None)]
+    PARTIALLY_TUNED_FUNCTIONALS = [('PADDED_HEAD', False)]
     DOWNGRADER = []
 
     @staticmethod
-    def gen_autotune_configs(fsel_dict : 'dict[str, Any]'):
+    def gen_autotune_configs(gpu, fsel_dict : 'dict[str, Any]'):
         dtype = fsel_dict['Q']
         ret = []
         # TODO: right sizes for fp32?
         BLOCK_SIZES = [16, 32, 64] if dtype != '*fp32:16' else [16, 32]
         WAVES_PER_EU = [0, 1, 2, 3, 4]
         NUM_WARPS = [1, 2, 4]
-        for M, N, waves, warps in itertools.product(BLOCK_SIZES,
-                                                    BLOCK_SIZES,
-                                                    WAVES_PER_EU,
-                                                    NUM_WARPS):
+        NUM_STAGES = [1, 2]
+        for M, N, waves, warps, stages in itertools.product(BLOCK_SIZES,
+                                                            BLOCK_SIZES,
+                                                            WAVES_PER_EU,
+                                                            NUM_WARPS,
+                                                            NUM_STAGES):
+            if M < N:
+                continue  # deduplicate
             kw = {'BLOCK_M': M, 'BLOCK_N': N, 'waves_per_eu': waves}
-            yield Config(kw, num_stages=1, num_warps=warps)
+            yield Config(kw, num_stages=stages, num_warps=warps)

@@ -5,7 +5,7 @@
 #include "shim.[[shim_kernel_name]].h"
 #include <aotriton/util.h>
 
-namespace aotriton::v2::[[kernel_family_name]] {
+namespace AOTRITON_NS::v2::[[kernel_family_name]] {
 
 int64_t [[param_class_name]]::godel_number() const
 {
@@ -31,8 +31,11 @@ hipError_t
 hipError_t
 [[context_class_name]]::launch(const [[param_class_name]]& params, hipStream_t stream) {
     auto arch = getArchFromStream(stream);
+    hipDeviceptr_t global_scratch = 0;
     [[put_kernel_arguments_on_stack]];
-    std::vector<void*> args = { [[let_kernel_arguments]] };
+    std::vector<void*> args = { [[let_kernel_arguments]],
+                                const_cast<void*>(static_cast<const void*>(&global_scratch)),
+    };
     dim3 grid = grid_calculator(params);
     return params.selected_kernel->invoke("[[triton_kernel_name]]", grid, args, stream);
 }

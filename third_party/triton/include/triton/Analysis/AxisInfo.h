@@ -27,11 +27,12 @@ public:
 public:
   AxisInfo() : AxisInfo({}, {}, {}) {}
 
-  AxisInfo(DimVectorT contiguity, DimVectorT divisibility, DimVectorT constancy)
+  AxisInfo(ArrayRef<int64_t> contiguity, ArrayRef<int64_t> divisibility,
+           ArrayRef<int64_t> constancy)
       : AxisInfo(contiguity, divisibility, constancy, std::nullopt) {}
 
-  AxisInfo(DimVectorT contiguity, DimVectorT divisibility, DimVectorT constancy,
-           std::optional<int64_t> constantValue)
+  AxisInfo(ArrayRef<int64_t> contiguity, ArrayRef<int64_t> divisibility,
+           ArrayRef<int64_t> constancy, std::optional<int64_t> constantValue)
       : contiguity(contiguity), divisibility(divisibility),
         constancy(constancy), constantValue(constantValue) {
     assert(divisibility.size() == contiguity.size());
@@ -180,8 +181,8 @@ public:
     for (auto funcOp : llvm::reverse(sortedFuncs)) {
       initialize(funcOp);
       funcOp.walk([&](CallOpInterface callOp) {
-        auto callee =
-            dyn_cast<FunctionOpInterface>(callOp.resolveCallable(&symbolTable));
+        auto callee = dyn_cast<FunctionOpInterface>(
+            callOp.resolveCallableInTable(&symbolTable));
         update(callOp, callee);
       });
     }

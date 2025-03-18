@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from attn_torch_function import attention, debug_fill_dropout_rng, DEFAULT_PHILOX_SEED, DEFAULT_PHILOX_OFFSET
+from attn_torch_function import attention, AttentionExtraArgs, debug_fill_dropout_rng, DEFAULT_PHILOX_SEED, DEFAULT_PHILOX_OFFSET
 
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
     # Efficient implementation equivalent to the following:
@@ -71,8 +71,6 @@ class FwdTester(object):
         self.use_fill_rng_for_dropout = False
 
     def do_test_op_fwd(self, BATCH, N_HEADS, D_HEAD, seqlen_q, seqlen_k, causal, sm_scale, dropout_p, dtype, storage_flip, bias_type):
-        if causal and seqlen_q != seqlen_k:
-            pytest.skip("PyTorch's Flash V2 does not accept casual=True when seqlen_q != seqlen_k. Skipping")
         if causal and bias_type is not None:
             pytest.skip("_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True")
         torch.manual_seed(20)
@@ -158,10 +156,11 @@ class FwdTester(object):
         p = torch.softmax(p.float(), dim=-1).half()
         ref_out = torch.matmul(p, v)
         '''
-        return_encoded_softmax = dropout_p > 0.0 and not self.use_fill_rng_for_dropout
-        # return_encoded_softmax = dropout_p > 0.0  # Reserved for debugging use_fill_rng_for_dropout
-        autotune = False
-        tri_out, encoded_softmax, _ = attention(q, k, v, b, causal, sm_scale, dropout_p, return_encoded_softmax, autotune)
+        ext = AttentionExtraArgs(return_encoded_softmax=dropout_p > 0.0 and not self.use_fill_rng_for_dropout,
+                                 autotune=False,
+                                 return_autotune=False,
+                                 fillnan=True)
+        tri_out, encoded_softmax, _ = attention(q, k, v, b, causal, sm_scale, dropout_p, ext)
 
         if self.use_fill_rng_for_dropout:
             rdims = (BATCH, N_HEADS, seqlen_q, seqlen_k)

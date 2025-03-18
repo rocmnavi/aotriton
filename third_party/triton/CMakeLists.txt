@@ -12,7 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
-project(triton)
+project(triton CXX)
 include(CTest)
 
 if(NOT WIN32)
@@ -26,7 +26,24 @@ option(TRITON_BUILD_TUTORIALS "Build C++ Triton tutorials" ON)
 option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
 option(TRITON_BUILD_PROTON "Build the Triton Proton profiler" ON)
 option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
+option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
+
+if(TRITON_BUILD_WITH_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}"
+        CACHE STRING "C compiler launcher")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}"
+        CACHE STRING "CXX compiler launcher")
+  else()
+    message(
+      STATUS
+        "Could not find ccache. Consider installing ccache to speed up compilation."
+    )
+  endif()
+endif()
+
 
 # Ensure Python3 vars are set correctly
 # used conditionally in this file and by lit tests
@@ -47,9 +64,13 @@ if(NOT WIN32)
   find_library(TERMINFO_LIBRARY tinfo)
 endif()
 
+if(TRITON_BUILD_UT)
+  include(AddTritonUnitTest)
+endif()
+
 # Compiler flags
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC -std=gnu++17")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS  -fPIC -std=gnu++17")
 
 
 # #########
@@ -156,9 +177,6 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   if (DEFINED TRITON_PLUGIN_DIRS)
     foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
-      if (PLUGIN_DIR STREQUAL "nvidia")
-        continue()
-      endif()
       # Read the plugin name under dir/backend/name.conf
       cmake_path(APPEND PLUGIN_DIR "backend" "name.conf" OUTPUT_VARIABLE PLUGIN_NAME_PATH)
       file(READ ${PLUGIN_NAME_PATH} PLUGIN_NAME)
@@ -209,6 +227,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRSCFToControlFlow
     MLIRIndexToLLVM
     MLIRGPUToROCDLTransforms
+    MLIRUBToLLVM
 
     # LLVM
     LLVMPasses
@@ -219,7 +238,8 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   )
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
-     CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")     # macOS arm64
+     CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64
+     CMAKE_OSX_ARCHITECTURES MATCHES "arm64")  # also macOS arm64
       list(APPEND TRITON_LIBRARIES
           LLVMAArch64CodeGen
           LLVMAArch64AsmParser

@@ -106,22 +106,23 @@ def do_compile(args):
 
     hints = {i: constexpr(s.split(":")[1]) for i, s in enumerate(signature) if ":" in s}
     hints = {k: v for k, v in hints.items() if v is not None}
-    constants = {i: constexpr(s) for i, s in enumerate(signature)}
+    constants = {kernel.arg_names[i]: constexpr(s) for i, s in enumerate(signature)}
     constants = {k: v for k, v in constants.items() if v is not None}
-    # print(f"{constexprs=}")
-    signature = {i: s.split(":")[0] for i, s in enumerate(signature) if i not in constants}
+    signature = {
+        kernel.arg_names[i]: s.split(":")[0]
+        for i, s in enumerate(signature)
+        if kernel.arg_names[i] not in constants
+    }
     const_sig = 'x'.join([str(v) for v in constants.values()])
-    doc_string = [f"{kernel.arg_names[i]}={constants[i]}" for i in constants.keys()]
+    doc_string = [f"{k}={v}" for k, v in constants.items()]
     doc_string += [f"num_warps={args.num_warps}", f"num_stages={args.num_stages}"]
 
     # compile ast into cubin
     for h in hints.values():
         assert h in [1, 16], f"Only 1 and 16 are valid hints, got {h}"
-    divisible_by_16 = [i for i, h in hints.items() if h == 16]
-    equal_to_1 = [i for i, h in hints.items() if h == 1]
-    attrs = triton.compiler.AttrsDescriptor(divisible_by_16=divisible_by_16, equal_to_1=equal_to_1)
-    for i in equal_to_1:
-        constants.update({i: 1})
+    attrs = triton.backends.compiler.AttrsDescriptor.from_hints(hints)
+    for p, v in attrs.get_constants().items():
+        constants.update({kernel.arg_names[p]: v})
     src = triton.compiler.ASTSource(fn=kernel, constants=constants, signature=signature, attrs=attrs)
     opts = {"num_warps": args.num_warps, "num_stages": args.num_stages}
     ccinfo = triton.compile(src, target=KNOWN_TARGETS[args.target], options=opts)
@@ -158,19 +159,20 @@ def main():
     worker = Process(target=ipc_compile, args=(ipc_to_worker, ipc_worker_out))
     worker.start()
     ipc_to_worker.put(args)
-    try:
-        status = ipc_worker_out.get(timeout=args.timeout * 60.0)
-    except queue.Empty:
-        status = 'Timeout'
+    worker.join(args.timeout * 60.0)
+    if worker.exitcode == 0:
+        status = ipc_worker_out.get()
+    elif worker.exitcode is None:
         worker.kill()
+        status = 'Timeout'
+    else:
+        status = 'ExitWithError'
+    if status == 'Timeout':
         print(f'Compiling {args.path=} {args.kernel_name} to {args.out_path=} timed out with {args.timeout} minutes',
               file=sys.stderr)
     ipc_to_worker.close()
     ipc_worker_out.close()
-    worker.join()
-    if status != 'Timeout' and worker.exitcode != 0:
-        status = 'ExitWithError'
-    if args.verbose:
+    if args.verbose and status == 'ExitWithError':
         print(f'Compiling {args.path=} {args.kernel_name} to {args.out_path=} result with status {status} exitcode {worker.exitcode}')
     # Write an empty file to avoid errors
     if status != 'Complete':

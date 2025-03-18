@@ -4,18 +4,20 @@
 #ifndef AOTRITON_V2_API_FLASH_ATTN_H
 #define AOTRITON_V2_API_FLASH_ATTN_H
 
+#include <aotriton/config.h>
 #include "runtime.h"
 #include "util.h"
 #include "cpp_tune.h"
 
-namespace aotriton::v2::flash {
+namespace AOTRITON_NS::v2::flash {
 
 hipError_t
-check_gpu(aotriton::Stream stream);
+check_gpu(AOTRITON_NS::Stream stream);
 
-using T4 = aotriton::TensorView<4>;
-using T2 = aotriton::TensorView<2>;
-using T1 = aotriton::TensorView<1>;
+using T4 = AOTRITON_NS::TensorView<4>;
+using T2 = AOTRITON_NS::TensorView<2>;
+using T1 = AOTRITON_NS::TensorView<1>;
+using T0 = AOTRITON_NS::TensorView<0>;
 
 struct FwdExtraArguments : public CppTune {
 };
@@ -35,11 +37,14 @@ attn_fwd(T4 q, // batch_size x num_heads x seqlen_q x head_size
          T2 softmax_lse,
          T4 Out, // batch_size x num_heads x seqlen_q x head_size
          float dropout_p,
-         uint64_t philox_seed,
-         uint64_t philox_offset,
+         T0 philox_seed,
+         T0 philox_offset1,
+         int64_t philox_offset2,
+         T0 philox_seed_output,
+         T0 philox_offset_output,
          T4 encoded_softmax,
          bool is_causal,
-         aotriton::Stream stream,
+         AOTRITON_NS::Stream stream,
          FwdExtraArguments* extargs = nullptr);
 
 hipError_t
@@ -55,11 +60,14 @@ attn_fwd_compact_varlen(T4 q, // 1 x num_heads x total_q x head_size, total_q :=
                         T2 softmax_lse,
                         T4 Out, // 1 x num_heads x total_q x head_size
                         float dropout_p,
-                        uint64_t philox_seed,
-                        uint64_t philox_offset,
+                        T0 philox_seed,
+                        T0 philox_offset1,
+                        int64_t philox_offset2,
+                        T0 philox_seed_output,
+                        T0 philox_offset_output,
                         T4 encoded_softmax,
                         bool is_causal,
-                        aotriton::Stream stream,
+                        AOTRITON_NS::Stream stream,
                         FwdExtraArguments* extargs = nullptr);
 
 hipError_t
@@ -77,10 +85,11 @@ attn_bwd(T4 q, // batch_size x num_heads x seqlen_q x head_size
          T2 softmax_lse,
          T2 delta, // buffer, empty_like(softmax_lse)
          float dropout_p,
-         uint64_t philox_seed,
-         uint64_t philox_offset,
+         T0 philox_seed,
+         T0 philox_offset1,
+         int64_t philox_offset2,
          bool is_causal,
-         aotriton::Stream stream,
+         AOTRITON_NS::Stream stream,
          BwdExtraArguments* extargs = nullptr);
 
 hipError_t
@@ -102,18 +111,25 @@ attn_bwd_compact_varlen(T4 q, // 1 x num_heads x total_q x head_size, total_q :=
                         T2 softmax_lse,
                         T2 delta, // buffer, empty_like(softmax_lse)
                         float dropout_p,
-                        uint64_t philox_seed,
-                        uint64_t philox_offset,
+                        T0 philox_seed,
+                        T0 philox_offset1,
+                        int64_t philox_offset2,
                         bool is_causal,
-                        aotriton::Stream stream,
+                        AOTRITON_NS::Stream stream,
                         BwdExtraArguments* extargs = nullptr);
 
 hipError_t
 debug_fill_dropout_rng(T4 r,
                        uint64_t philox_seed,
                        uint64_t philox_offset,
-                       aotriton::Stream stream);
+                       AOTRITON_NS::Stream stream);
 
-} // aotriton::v2::flash
+hipError_t
+debug_fill_dropout_rng_tensor(T4 r,
+                              T0 philox_seed,
+                              T0 philox_offset,
+                              AOTRITON_NS::Stream stream);
+
+} // AOTRITON_NS::v2::flash
 
 #endif

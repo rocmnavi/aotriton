@@ -3,6 +3,7 @@
 
 from .rules import kernels as triton_kernels
 from .tuning_database import KernelTuningDatabase
+from .tuning_lut import MissingLutEntry
 import io
 import shutil
 import argparse
@@ -49,12 +50,15 @@ def parse():
                    help="Ahead of Time (AOT) Compile Architecture. PyTorch is required for autodetection if --targets is missing.")
     p.add_argument("--build_dir", type=str, default='build/', help="build directory")
     p.add_argument("--archive_only", action='store_true', help='Only generate archive library instead of shared library. No linking with dependencies.')
-    p.add_argument("--enable_zstd", type=str, default=None, nargs='*', help="Use zstd to compress the compiled kernel")
+    p.add_argument("--library_suffix", type=str, default='', help="Add suffix to the library name 'aotriton' to avoid symbol conflicts")
     p.add_argument("--bare_mode", action='store_true', help="Instead of generating a proper Makefile, only generate a list of source files and leave the remaining tasks to cmake.")
+    p.add_argument("--noimage_mode", action='store_true', help="Expect the GPU kernel images are built separately.")
     p.add_argument("--build_for_tuning", action='store_true', help="Include all GPU kernels in the dispatcher for performance tuning.")
     p.add_argument("--verbose", action='store_true', help="Print debugging messages")
+    p.add_argument("--lut_sanity_check", action='store_true', help="Do not raise exceptions when the look up table (lut) is incomplete.")
     args = p.parse_args()
     args._build_root = Path(args.build_dir)
+    args._sanity_check_exceptions = []
     # print(args)
     return args
 
@@ -130,12 +134,6 @@ class MakefileSegmentGenerator(Generator):
     def __init__(self, args, out):
         super().__init__(args, out);
         self._cc_cmd = '$(HIPCC) $(EXTRA_COMPILER_OPTIONS) '
-        if self._args.enable_zstd is not None:
-            for d in self._args.enable_zstd:
-                self._cc_cmd += f' "-I{d}" '
-            self._cc_cmd += f'-DAOTRITON_USE_ZSTD=1'
-        else:
-            self._cc_cmd += ' -DAOTRITON_USE_ZSTD=0'
         self._cc_cmd += f' -I{INCBIN} -I{COMMON_INCLUDE} -fPIC -std=c++20'
 
     @property
@@ -324,7 +322,7 @@ class KernelShimGenerator(MakefileSegmentGenerator):
 
         if self.is_bare:
             return
-        for o in k.gen_all_object_files(p, tuned_db=self._ktd, sancheck_fileexists=not args.build_for_tuning):
+        for o in k.gen_all_object_files(p, tuned_db=self._ktd, sancheck_fileexists=not args.build_for_tuning and not args.noimage_mode):
             yield ObjectShimCodeGenerator(self._args, k, o)
 
     def write_conclude(self):
@@ -332,7 +330,7 @@ class KernelShimGenerator(MakefileSegmentGenerator):
             return
         objs = [c._odesc for c in self._children if isinstance(c, ObjectShimCodeGenerator)]
         self._kdesc.write_shim_header(self._fhdr, objs)
-        self._kdesc.write_shim_source(self._fsrc, objs)
+        self._kdesc.write_shim_source(self._fsrc, objs, noimage_mode=self._args.noimage_mode)
 
     @property
     def list_of_self_object_files(self) -> 'list[Path]':
@@ -350,10 +348,23 @@ class AutotuneCodeGenerator(MakefileSegmentGenerator):
 
     def write_body(self):
         self.verbose('AutotuneCodeGenerator')
+        do_raise = None
         # Write the code to file
-        self._ofn = self._lut.write_lut_source(self._outdir,
-                                               compressed=self._args.enable_zstd is not None,
-                                               bare_mode=self.is_bare)
+        try:
+            self._ofn = self._lut.write_lut_source(self._args.library_suffix,
+                                                   self._outdir,
+                                                   bare_mode=self.is_bare,
+                                                   noimage_mode=self._args.noimage_mode)
+        except MissingLutEntry as e:
+            self._ofn = e.ofn  # regardless --build_for_tuning or not
+            if not self._args.build_for_tuning:
+                do_raise = e
+                print(e)
+                self._args._sanity_check_exceptions.append(e)
+                for j in e.get_missing_lut_entries():
+                    print("TUNE_FLASH --entry_from_json Item: ", j)
+            else:
+                pass  # Ignore MissingLutEntry when --build_for_tuning
         self.verbose(f'\t lut = {self._fsels}')
         self.verbose(f'\t ofn = {self._ofn}')
         self._obj_fn = self._ofn.with_suffix('.o')
@@ -366,6 +377,8 @@ class AutotuneCodeGenerator(MakefileSegmentGenerator):
             print(self._makefile_target, ':', self._ofn.relative_to(self._build_dir), file=self._out)
             cmd  = self._cc_cmd + f' {self._ofn.absolute()} -o {self._obj_fn.absolute()} -c'
             print('\t', cmd, '\n', file=self._out)
+        if do_raise and not self._args.lut_sanity_check:
+            raise do_raise
 
     @property
     def list_of_self_object_files(self) -> 'list[Path]':
@@ -397,6 +410,8 @@ def main():
     args = parse()
     gen = ShimMakefileGenerator(args)
     gen.generate()
+    for e in args._sanity_check_exceptions:
+        raise e
 
 if __name__ == '__main__':
     main()

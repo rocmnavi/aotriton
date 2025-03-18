@@ -1,13 +1,14 @@
 <div align="center">
-  <img src="https://cdn.openai.com/triton/assets/triton-logo.png" alt="Triton logo" width="88" height="100">
+  <img src="https://lh5.googleusercontent.com/wzQKEsTFkrgNQO9JjhGH5wFvslJr1saLtLaJ_a6Fp_gNENpvt3VG7BmztwngU9hFJaU4CPwGiw1opQtDvTkLrxWRbO_a12Q-pdESWHgtmheIHcPbOL5ZMC4TSiJVe5ty1w=w3517" alt="Triton logo">
 </div>
 
-We're hiring! If you are interested in working on Triton at OpenAI, we have roles open for [Compiler Engineers](https://openai.com/careers/software-engineer-triton-compiler) and [Kernel Engineers](https://openai.com/careers/kernel-engineer).
+The Triton Conference is happening again on September 17th, 2024 in Fremont (CA)!
+
+If you are interested in attending, please fill up [this form](https://docs.google.com/forms/d/e/1FAIpQLSecHC1lkalcm0h3JDUbspekDX5bmBvMxgVTLaK3e-61bzDDbg/viewform).
 
 | **`Documentation`** | **`Nightly Wheels`** |
 |-------------------- | -------------------- |
 | [![Documentation](https://github.com/triton-lang/triton/actions/workflows/documentation.yml/badge.svg)](https://triton-lang.org/) | [![Wheels](https://github.com/triton-lang/triton/actions/workflows/wheels.yml/badge.svg?branch=release/2.0.x)](https://github.com/triton-lang/triton/actions/workflows/wheels.yml) |
-
 
 # Triton
 
@@ -21,37 +22,38 @@ The [official documentation](https://triton-lang.org) contains installation inst
 
 You can install the latest stable release of Triton from pip:
 
-```bash
+```shell
 pip install triton
 ```
+
 Binary wheels are available for CPython 3.8-3.12 and PyPy 3.8-3.9.
 
 And the latest nightly release:
 
-```bash
+```shell
 pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
 ```
 
 # Install from source
 
-```
+```shell
 git clone https://github.com/triton-lang/triton.git;
 cd triton;
 
-pip install ninja cmake wheel; # build-time dependencies
+pip install ninja cmake wheel pybind11; # build-time dependencies
 pip install -e python
 ```
 
 Or with a virtualenv:
 
-```
+```shell
 git clone https://github.com/triton-lang/triton.git;
 cd triton;
 
 python -m venv .venv --prompt triton;
 source .venv/bin/activate;
 
-pip install ninja cmake wheel; # build-time dependencies
+pip install ninja cmake wheel pybind11; # build-time dependencies
 pip install -e python
 ```
 
@@ -114,9 +116,10 @@ arbitrary LLVM version.
   (probably because, in our build, users don't invoke cmake directly, but
   instead use setup.py).  Teach vscode how to compile Triton as follows.
 
-    - Do a local build.
+    - Do a local build. Run command `pip install -e python`
     - Get the full path to the `compile_commands.json` file produced by the build:
-      `find python/build -name 'compile_commands.json | xargs readlink -f'`
+      `find python/build -name 'compile_commands.json' | xargs readlink -f`.
+      You might get a full path similar to `/Users/{username}/triton/python/build/cmake.macosx-11.1-arm64-cpython-3.12/compile_commands.json`
     - In vscode, install the
       [C/C++
       extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools),
@@ -143,7 +146,7 @@ $ python3 -m pytest python/test/unit
 $ cd python/build/cmake<...>
 
 # Run C++ unit tests.
-$ ninja test
+$ ctest -j32
 
 # Run lit tests.
 $ lit test
@@ -152,14 +155,14 @@ $ lit test
 You may find it helpful to make a symlink to the builddir and tell your local
 git to ignore it.
 
-```
+```shell
 $ ln -s python/build/cmake<...> build
 $ echo build >> .git/info/exclude
 ```
 
 Then you can e.g. rebuild and run lit with the following command.
 
-```
+```shell
 $ ninja -C build && ( cd build ; lit test )
 ```
 
@@ -171,7 +174,11 @@ For detailed instructions on how to debug Triton's frontend, please refer to thi
 
 - `MLIR_ENABLE_DUMP=1` dumps the IR before every MLIR pass Triton runs, for all
    kernels. Use `MLIR_ENABLE_DUMP=kernelName` to dump for a specific kernel only.
+  - Triton cache can interfere with the dump. In cases where `MLIR_ENABLE_DUMP=1` does not work, try cleaning your triton cache: `rm -r ~/.triton/cache/*`
 - `LLVM_IR_ENABLE_DUMP=1` dumps the IR before every pass run over the LLVM IR.
+- `TRITON_REPRODUCER_PATH=<reproducer_path>` will generate an MLIR reproducer file
+  at `<reproducer_path>` before each MLIR compiler stage. If any of the stages fail,
+  `<reproducer_path>` will be a local MLIR reproducer captured right before the failing pass.
 - `TRITON_INTERPRET=1` uses the Triton interpreter instead of running on the
   GPU.  You can insert Python breakpoints in your kernel code!
 - `TRITON_ENABLE_LLVM_DEBUG=1` passes `-debug` to LLVM, printing a lot of
@@ -190,10 +197,11 @@ For detailed instructions on how to debug Triton's frontend, please refer to thi
   separated values to be specified (eg
   `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions` or
   `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions,regalloc"`).
-- `USE_TTGIR_LOC=1` reparses the ttgir such that the location information will
-  be the line number of the ttgir instead of line number of the python file.
-  This can provide a direct mapping from ttgir to llir/ptx. When used with
-  performance tools, it can provide a breakdown on ttgir instructions.
+- `USE_IR_LOC={ttir,ttgir}` reparses the IR such that the location information
+  will be the line number of the IR file with that particular extension,
+  instead of line number of the python file. This can provide a direct mapping
+  from the IR to llir/ptx. When used with performance tools, it can provide a
+  breakdown on IR instructions.
 - `TRITON_PRINT_AUTOTUNING=1` prints out the best autotuning config and total time
   spent for each kernel after autotuning is complete.
 - `DISABLE_LLVM_OPT` will disable llvm optimizations for make_llir and make_ptx
@@ -211,6 +219,7 @@ For detailed instructions on how to debug Triton's frontend, please refer to thi
 # Changelog
 
 Version 2.0 is out! New features include:
+
 - Many, many bug fixes
 - Performance improvements
 - Backend rewritten to use MLIR
@@ -220,12 +229,14 @@ Version 2.0 is out! New features include:
 
 Community contributions are more than welcome, whether it be to fix bugs or to add new features at [github](https://github.com/triton-lang/triton/). For more detailed instructions, please visit our [contributor's guide](CONTRIBUTING.md).
 
-
 # Compatibility
 
 Supported Platforms:
-  * Linux
+
+- Linux
 
 Supported Hardware:
-  * NVIDIA GPUs (Compute Capability 7.0+)
-  * Under development: AMD GPUs, CPUs
+
+- NVIDIA GPUs (Compute Capability 8.0+)
+- AMD GPUs (ROCm 5.2+)
+- Under development: CPUs

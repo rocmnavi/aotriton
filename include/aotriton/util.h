@@ -4,13 +4,14 @@
 #ifndef AOTRITON_V2_API_UTIL_H
 #define AOTRITON_V2_API_UTIL_H
 
+#include <aotriton/config.h>
 #include "dtypes.h"
 #include "runtime.h"
 #include <functional>
 #include <stdint.h>
 #include <string_view>
 
-namespace aotriton {
+namespace AOTRITON_NS {
 
 constexpr uint64_t
 CAT(uint32_t high, uint32_t low) {
@@ -80,6 +81,7 @@ public:
   std::array<uint64_t, Rank> sizes() const {
     return sizes_;
   }
+
   std::array<uint64_t, Rank> strides() const {
     return strides_;
   }
@@ -105,6 +107,48 @@ private:
   DType dtype_ = kUnknown;
 };
 
+template<>
+class TensorView<0> {
+public:
+  TensorView(intptr_t base, DType dtype)
+    : base_(reinterpret_cast<void*>(base))
+    , dtype_(dtype) {
+  }
+
+  operator bool() const {
+    return base_ != nullptr;
+  }
+
+  uint64_t size(int i) const {
+    return i == 0 ? 1 : 0;
+  }
+
+  uint64_t stride(int i) const {
+    return i == 0 ? 1 : 0;
+  }
+
+  std::array<uint64_t, 0> sizes() const {
+    return {};
+  }
+
+  std::array<uint64_t, 0> strides() const {
+    return {};
+  }
+
+  const void* data_ptr() const {
+    return base_;
+  }
+
+  DType dtype() const {
+    return dtype_;
+  }
+
+private:
+  const void* base_ = nullptr;
+  DType dtype_ = kUnknown;
+};
+
+
 extern template class TensorView<1>;
 extern template class TensorView<2>;
 extern template class TensorView<3>;
@@ -112,6 +156,6 @@ extern template class TensorView<4>;
 
 GpuArch getArchFromStream(hipStream_t);
 
-} // namespace aotriton
+} // namespace AOTRITON_NS
 
 #endif

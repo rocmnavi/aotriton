@@ -28,6 +28,7 @@ Creation Ops
     full
     zeros
     zeros_like
+    cast
 
 
 Shape Manipulation Ops
@@ -58,6 +59,7 @@ Linear Algebra Ops
     :nosignatures:
 
     dot
+    dot_scaled
 
 
 Memory/Pointer Ops

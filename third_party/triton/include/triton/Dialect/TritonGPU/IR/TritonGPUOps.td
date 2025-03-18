@@ -84,6 +84,7 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
 ]> {
   let summary = "copy data from global memory to local memory asynchronously";
 
+  let hasVerifier = 1;
   let description = [{
     This operation copies data from global memory to local memory asynchronously.
     This is analogue to tt.load except the data are copied to local memory pointed
@@ -142,17 +143,33 @@ def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<MemoryEf
 
     Explicitly deallocating a buffer is optional; see local_dealloc.
   }];
-  let arguments = (ins Optional<TT_Tensor>:$src);
+  let arguments = (
+    ins
+    Optional<TT_Tensor>:$src,
+    OptionalAttr<I32Attr>:$alignment
+  );
+
+  let builders = [
+    OpBuilder<(ins "Type":$result),
+              [{ build($_builder, $_state, result, Value(), IntegerAttr()); }]>,
+    OpBuilder<(ins "Type":$result, "Value":$src),
+              [{ build($_builder, $_state, result, src, IntegerAttr()); }]>,
+    OpBuilder<(ins "Type":$result, "Value":$src, "int32_t":$alignment),
+              [{ build($_builder, $_state, result, src, $_builder.getI32IntegerAttr(alignment)); }]>
+  ];
 
   let extraClassDeclaration = [{
     bool isSharedMemoryAlloc() {
       return getType().getMemorySpace() &&
              isa<SharedMemorySpaceAttr>(getType().getMemorySpace());
     }
+    int32_t getAlignmentOrDefault();
   }];
   let assemblyFormat = [{$src attr-dict `:` functional-type(operands, results)}];
 
   let results = (outs TT_MemDescType:$result);
+  let hasFolder = 1;
+  let hasVerifier = 1;
 }
 
 // Deallocate shared memory
@@ -232,10 +249,53 @@ def TTG_LocalStoreOp : TTG_Op<"local_store", [DeclareOpInterfaceMethods<MemoryEf
   }];
   let arguments = (ins TT_Tensor:$src, TT_MemDescType:$dst);
 
+  let hasVerifier = 1;
   // Use qualified() otherwise "!tt.memdesc<X>" is printed as "<X>".
   let assemblyFormat = [{
     $src `,` $dst attr-dict `:` type($src) `->` qualified(type($dst))
   }];
+}
+
+def TTG_UpcastMXFPOp : TTG_Op<"upcast_mxfp", [Pure, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Convert an mxfp tensor to bf16";
+
+  let hasVerifier = 1;
+
+  let description = [{
+    Compute the bf16 encoded in the given mxfp number as per
+    https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+  }];
+  let arguments = (ins
+                   TT_Tensor:$src,
+                   TT_Tensor:$scale,
+                   TT_ScaleDotElemTypeAttr:$fp_type);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `,` $scale  `fp_type` `=` $fp_type attr-dict `:` type($src) `,` type($scale) `->` type($result)
+  }];
+}
+
+// Allocate global memory
+def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc", [MemoryEffects<[MemAlloc<GlobalMemory>]>]> {
+  let summary = "allocate a global memory buffer";
+  let description = [{
+    This operation allocates a buffer in global memory that is private to the current program.
+  }];
+  let arguments = (
+    ins
+    I32Attr:$nbytes,
+    I32Attr:$alignment
+  );
+  let results = (outs TT_Ptr:$result);
+
+  let builders = [
+    OpBuilder<(ins "Type":$result, "int32_t":$nbytes, "int32_t":$alignment),
+              [{ build($_builder, $_state, result,
+                       $_builder.getI32IntegerAttr(nbytes), $_builder.getI32IntegerAttr(alignment)); }]>
+  ];
+
+  let assemblyFormat = [{attr-dict `:` qualified(type($result))}];
 }
 
 #endif

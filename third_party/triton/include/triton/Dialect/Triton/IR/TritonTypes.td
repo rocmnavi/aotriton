@@ -15,7 +15,7 @@ class TritonTypeDef<string name, string _mnemonic, list<Trait> traits = []>
 }
 
 // Floating-point Type
-def TT_Float : AnyTypeOf<[F8E4M3FNUZ, F8E5M2, F8E5M2FNUZ, F16, BF16, F32, F64], "floating-point">;
+def TT_Float : AnyTypeOf<[F8E4M3FN, F8E4M3FNUZ, F8E5M2, F8E5M2FNUZ, F16, BF16, F32, F64], "floating-point">;
 def TT_FloatTensor : RankedTensorOf<[TT_Float]>;
 def TT_FloatLike : AnyTypeOf<[TT_Float, TT_FloatTensor]>;
 
@@ -140,5 +140,16 @@ def TT_MemDescType : TritonTypeDef<"MemDesc", "memdesc", [ShapedTypeInterface]> 
   let hasCustomAssemblyFormat = 1;
 }
 
+// Result type of ExperimentalMakeTensorDescriptor
+def TT_TensorDescType : TritonTypeDef<"TensorDesc", "tensordesc", []> {
+  let summary = "Tensor descriptor type (`::mlir::triton::TensorDescType`) in Triton IR type system";
+
+  let description = [{
+      A portable abstraction for nvidia-TMA descriptors.
+  }];
+
+  let parameters = (ins "RankedTensorType":$blockType);
+  let assemblyFormat = "`<` $blockType `>`";
+}
 
 #endif
