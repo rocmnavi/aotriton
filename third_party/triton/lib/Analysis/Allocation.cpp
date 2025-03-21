@@ -41,10 +41,8 @@ static SmallVector<unsigned> getRepShapeForCvt(RankedTensorType srcTy,
 
   auto srcShapePerCTA = gpu::getShapePerCTA(srcTy);
   auto dstShapePerCTA = gpu::getShapePerCTA(dstTy);
-  auto srcShapePerCTATile =
-      gpu::getShapePerCTATile(srcLayout, srcTy.getShape());
-  auto dstShapePerCTATile =
-      gpu::getShapePerCTATile(dstLayout, dstTy.getShape());
+  auto srcShapePerCTATile = gpu::getShapePerCTATile(srcLayout);
+  auto dstShapePerCTATile = gpu::getShapePerCTATile(dstLayout);
 
   assert(srcTy.getRank() == dstTy.getRank() &&
          "src and dst must have the same rank");
@@ -125,6 +123,10 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
   }
   if (auto scanOp = dyn_cast<ScanOp>(op)) {
     ScanLoweringHelper helper(scanOp);
+    return helper.getScratchSizeInBytes();
+  }
+  if (auto gatherOp = dyn_cast<GatherOp>(op)) {
+    GatherLoweringHelper helper(gatherOp);
     return helper.getScratchSizeInBytes();
   }
   if (auto histogram = dyn_cast<HistogramOp>(op)) {

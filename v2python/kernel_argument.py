@@ -1,9 +1,10 @@
-# Copyright © 2023-2024 Advanced Micro Devices, Inc.
+# Copyright © 2023-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
 import numpy as np
 from enum import Enum
 from .object_desc import ObjectFileDescription
+from copy import deepcopy
 
 '''
 Note: we category the Triton kernel arguments into three types.
@@ -18,10 +19,16 @@ class ArgumentMetadata(object):
         'fp16' : 'DType::kFloat16',
         'bf16' : 'DType::kBFloat16',
         'fp32' : 'DType::kFloat32',
+        'i32'  : 'DType::kInt32',
+        'u32'  : 'DType::kUInt32',
+        'u64'  : 'DType::kUInt64',
     }
     def __init__(self, grouped_arguments_as_set, possible_values, cat : ArgumentCategory, kdesc):
         assert grouped_arguments_as_set
         self._grouped_arguments_as_set = grouped_arguments_as_set
+        for v in possible_values:
+            if callable(v):
+                assert 'return' in v.__annotations__, f'PERF_CHOICES {grouped_arguments_as_set} in Class {kdesc} must have return type annotations'
         self._possible_values = possible_values
         self._npossible = len(possible_values)
         self._cat = cat
@@ -118,11 +125,18 @@ class ArgumentMetadata(object):
         triton_type = self._possible_values[0]
         return isinstance(triton_type, bool)
 
+    @property
+    def is_int(self) -> bool:
+        triton_type = self._possible_values[0]
+        return isinstance(triton_type, int)
+
     def get_param_cc_type(self, triton_arg):
         triton_type = self._possible_values[0]
         if self.is_tensor:
             rank = self._kdesc.get_tensor_rank(triton_arg)
             return f'const T{rank}*'
+        if callable(triton_type):
+            triton_type = triton_type.__annotations__['return']()
         if isinstance(triton_type, str):
             return ObjectFileDescription.SIGNATURE_TO_C[triton_type]
         elif isinstance(triton_type, bool):
@@ -173,11 +187,28 @@ class ArgumentMetadata(object):
         self._incomplete_tuning = True
         self._fallback_tuning_value = fallback_value
 
+    def get_codegen_compiled_in_features_ctype(self):
+        ctype = None
+        if self.is_bool:
+            ctype = 'bool'
+        elif self.is_int:
+            ctype = 'int32_t'
+        else:
+            assert False, f'compiled_in_features: unknown meta type, choices {meta._possible_values}'
+        return ctype
+
+    def get_codegen_compiled_in_features_values(self):
+        if self.is_bool:
+            return ['true' if v else 'false' for v in self._possible_values]
+        return [str(v) for v in self._possible_values]
+
 class ArgumentSelection(object):
     def __init__(self, meta : ArgumentMetadata, selection_index : int):
         self._meta = meta
         self._selection_index = selection_index
-        self._selection_value = self._meta.select(selection_index)
+        self._selection = self._meta.select(selection_index)
+        self._is_lambda = callable(self._selection)
+        self._selection_value = self._selection if not self._is_lambda else None
 
     @property
     def meta(self):
@@ -197,7 +228,21 @@ class ArgumentSelection(object):
 
     @property
     def argument_value(self):
+        assert self._selection_value is not None
         return self._selection_value
+
+    @property
+    def is_lambda(self):
+        return self._is_lambda
+
+    def substitute_if_lambda(self, gpu, fsel_dict):
+        if self.is_lambda:
+            copy = deepcopy(self)
+            copy._selection_value = copy._selection(gpu, fsel_dict)
+            assert copy._selection_value is not None
+            # print(f"substitute_if_lambda to {copy._selection_value} {fsel_dict=}")
+            return copy
+        return self
 
     @property
     def godel_number(self):
@@ -205,7 +250,7 @@ class ArgumentSelection(object):
 
     @property
     def triton_signature(self):
-        return str(self._selection_value)
+        return str(self.argument_value)
 
     # compact_signature must be valid file name
     @property
@@ -244,4 +289,10 @@ class TunedArgument(ArgumentSelection):
         self._meta = meta
         assert not meta.is_functional, f'Functional argument cannot be tuned'
         self._selection_index = None
-        self._selection_value = bool(value) if meta.is_bool else value
+        if callable(value):
+            self._selection = value
+            self._is_lambda = True
+            self._selection_value = None
+        else:
+            self._is_lambda = False
+            self._selection_value = bool(value) if meta.is_bool else value

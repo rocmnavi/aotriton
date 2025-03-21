@@ -9,14 +9,16 @@ import io
 import shutil
 import sys
 from pathlib import Path
-
-# TODO: merge with generate_compile.py
+import os
+SKIPPED_LUT_CHECK = os.getenv('AOTRITON_SKIP_LUT_CHECK', default='').split(',')
 
 GPU_TO_DIRECTORY = {
     'MI200'  : 'amd-gfx90a',
     'MI300X' : 'amd-gfx942',
     'Navi31' : 'amd-gfx110x',
     'Navi32' : 'amd-gfx110x',
+    'Unidentified' : 'amd-gfx950',
+    'RX9070XT'    : 'amd-gfx120x',
 }
 
 GPU_TO_CLUSTER_SUFFIX = {
@@ -24,6 +26,8 @@ GPU_TO_CLUSTER_SUFFIX = {
     'MI300X' : 'MI300X',
     'Navi31' : 'Navi3x',
     'Navi32' : 'Navi3x',
+    'Unidentified'      : 'Unidentified',
+    'RX9070XT'    : 'RX9070XT',
 }
 
 class MissingLutEntry(Exception):
@@ -62,7 +66,8 @@ class KernelTuningEntryForFunctionalOnGPU(object):
         self._autotune_key_class = { key : klass for key, klass in autotune_keys } if autotune_keys is not None else None
         self._sigs = []
         self._sig_dict = {}
-        if autotune_keys is None:
+        self._feature_disabled = self._kdesc.is_functional_disabled_on_gpu(self._dba.gpu, self._fsels)
+        if autotune_keys is None or self._feature_disabled:
             self._lut_dtype = np.int8
             self._lut_cdtype = f'int8_t'
             self._lut_tensor = np.array([0], dtype=np.int8)
@@ -166,7 +171,7 @@ class KernelTuningEntryForFunctionalOnGPU(object):
     def codegen_kernel_image_objects(self, kernel_image_dir, noimage_mode):
         kernel_image_symbols = []
         for _, _, o in self.gen_kernel_symbols(kernel_image_dir):
-            if not noimage_mode:
+            if not noimage_mode and not self._feature_disabled:
                 assert o.compiled_files_exist, f'Compiled file {o._hsaco_kernel_path} not exists'
             kernel_image_symbols.append(f'{{ PACKAGE_PATH, "{o.obj.stem}" }},')
         ALIGN = '\n' + 4 * ' '
@@ -190,7 +195,9 @@ class KernelTuningEntryForFunctionalOnGPU(object):
         godel_number = first_sig.godel_number
         ofn = outdir / f'{first_sig.functional_signature}_{first_sig.target_gpu}.cc'
         raise_lut_entry = False
-        if not self._kdesc.sancheck_lut_tensor(self._dba.gpu, lut_tensor, self._fsels):
+        if self._kdesc.FULL_KERNEL_NAME in SKIPPED_LUT_CHECK:
+            pass
+        elif not self._kdesc.sancheck_lut_tensor(self._dba.gpu, lut_tensor, self._fsels):
             raise_lut_entry = True
         if bare_mode:
             return ofn

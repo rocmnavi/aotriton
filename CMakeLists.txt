@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Advanced Micro Devices, Inc.
+# Copyright © 2023-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
@@ -7,7 +7,7 @@ project(AOTriton CXX C)
 
 # Version numbers
 set(AOTRITON_VERSION_MAJOR_INT 0)
-set(AOTRITON_VERSION_MINOR_INT 8)
+set(AOTRITON_VERSION_MINOR_INT 9)
 set(AOTRITON_VERSION_PATCH_INT 2)
 # Must have integer-suffix, other 0 generates
 # /* #undef AOTRITON_VERSION_MAJOR */
@@ -23,10 +23,14 @@ execute_process(
 )
 
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS   ON)
+set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS ON)
+set(CMAKE_NINJA_FORCE_RESPONSE_FILE         ON)
+set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES ON)
 
-set(AOTRITON_MIN_PYTHON 3.8 CACHE STRING "Minimal Python version for find_package.")
-if(AOTRITON_MIN_PYTHON VERSION_LESS "3.8")
-  message(FATAL_ERROR "Do not set AOTRITON_MIN_PYTHON lower than 3.8. The code itself does not support it.")
+set(AOTRITON_MIN_PYTHON 3.10 CACHE STRING "Minimal Python version for find_package.")
+if(AOTRITON_MIN_PYTHON VERSION_LESS "3.10")
+  message(FATAL_ERROR "Do not set AOTRITON_MIN_PYTHON lower than 3.10. The code itself does not support it.")
 endif()
 
 find_package(Python3 ${AOTRITON_MIN_PYTHON} COMPONENTS Interpreter REQUIRED)
@@ -38,10 +42,11 @@ set(VENV_DIR "${CMAKE_CURRENT_BINARY_DIR}/venv" CACHE STRING "Virtual Environmen
 option(AOTRITON_NO_PYTHON "Disable python binding build" OFF)
 option(AOTRITON_ENABLE_ASAN "Enable Address Sanitizer. Implies -g" OFF)
 option(AOTRITON_BUILD_FOR_TUNING "Build all GPU kernels and set -DAOTRITON_BUILD_FOR_TUNING=1 (=0 otherwise)" OFF)
+set(AOTRITON_BUILD_FOR_TUNING_BUT_SKIP_KERNEL "" CACHE STRING "Use tuning database for certain kernels when AOTRITON_BUILD_FOR_TUNING=ON")
 option(AOTRITON_ENABLE_FP32_INPUTS "Enable FP32 support." ON)
 option(AOTRITON_NOIMAGE_MODE "Only build C++ Shim part. Kernel image builds are disabled" OFF)
 set(AOTRITON_GPU_BUILD_TIMEOUT "8.0" CACHE STRING "GPU kernel compiler times out after X minutes. 0 for indefinite. Highly recommended if AOTRITON_BUILD_FOR_TUNING=On.")
-set(TARGET_GPUS "MI200;MI300X;Navi31" CACHE STRING "Target Architecture (Note here uses Trade names)")
+set(TARGET_GPUS "MI200;MI300X;Navi31;RX9070XT" CACHE STRING "Target Architecture (Note here uses Trade names)")
 
 # Early failure for python binding
 if(NOT AOTRITON_NO_PYTHON)
@@ -98,17 +103,16 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR} "${VENV_
 if(NOT AOTRITON_NOIMAGE_MODE)
   set(TRITON_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/triton_build")
   execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${TRITON_BUILD_DIR}")
-  set(AOTRITON_TRITON_SO "${CMAKE_CURRENT_LIST_DIR}/third_party/triton/python/triton/_C/libtriton.so")
-  set(AOTRITON_TRITON_EGGLINK "${VENV_SITE}/triton.egg-link")
-  message("AOTRITON_TRITON_EGGLINK ${AOTRITON_TRITON_EGGLINK}")
+  # set(AOTRITON_TRITON_EGGLINK "${VENV_SITE}/triton.egg-link")
+  # message("AOTRITON_TRITON_EGGLINK ${AOTRITON_TRITON_EGGLINK}")
+  set(AOTRITON_TRITON_SO "${VENV_SITE}/triton/_C/libtriton.so")
 
-  add_custom_command(OUTPUT "${AOTRITON_TRITON_EGGLINK}"
-    COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR} TRITON_BUILD_DIR=${TRITON_BUILD_DIR} "${VENV_DIR}/bin/python" setup.py develop
+  add_custom_command(OUTPUT "${AOTRITON_TRITON_SO}"
+    COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR} TRITON_BUILD_DIR=${TRITON_BUILD_DIR} "${VENV_DIR}/bin/python" -m pip install .
     # COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR} python -m pip show triton
     WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/third_party/triton/python/"
-    BYPRODUCTS "${AOTRITON_TRITON_SO}"
   )
-  add_custom_target(aotriton_venv_triton ALL DEPENDS ${AOTRITON_TRITON_EGGLINK})
+  add_custom_target(aotriton_venv_triton ALL DEPENDS "${AOTRITON_TRITON_SO}")
 endif(NOT AOTRITON_NOIMAGE_MODE)
 
 add_subdirectory(v2src)

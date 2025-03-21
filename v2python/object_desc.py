@@ -22,8 +22,8 @@ class ObjectFileDescription(object):
         return t.startswith('*')
 
     DEFAULT_NUM_WARPS = 4
-    DEFAULT_NUM_STAGES = 4
-    DEFAULT_WAVES_PER_EU = 0
+    DEFAULT_NUM_STAGES = 1
+    DEFAULT_WAVES_PER_EU = 1
 
     def __init__(self,
                  triton_kernel_desc : 'KernelDescription',
@@ -41,7 +41,7 @@ class ObjectFileDescription(object):
             with self._hsaco_metatdata_path.open('r') as f:
                 self._metadata = json.load(f)
         else:
-            if sancheck_fileexists:
+            if sancheck_fileexists and not self.is_functional_disabled():
                 assert False, f'GPU Kernel {self._hsaco_kernel_path} failed to compile. This is a bug when -DAOTRITON_BUILD_FOR_TUNING=OFF'
             self._metadata = {}
 
@@ -237,6 +237,9 @@ class ObjectFileDescription(object):
             constant_values_with_hint.append(v)
         ALIGN1 = ',\n' + ' ' * align1
         return ALIGN1.join(constant_values_with_hint)
+
+    def is_functional_disabled(self):
+        return self._signature.is_functional_disabled()
 
     """
     def compute_template_arguments(self, align1=1, align2=10):

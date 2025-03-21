@@ -1,4 +1,4 @@
-// Copyright © 2023-2024 Advanced Micro Devices, Inc.
+// Copyright © 2023-2025 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
 #include <aotriton/config.h>
@@ -31,7 +31,21 @@ bwd_preprocess(T4 out, T4 dout, T2 delta, AOTRITON_NS::Stream stream_wrap) {
   //       Different kernels may have different rules.
   constexpr int kMinHeadDimCompiled = 16;
   int head_size = out.size(3);
-  int head_size_rounded = std::max(kMinHeadDimCompiled, bit_ceil(head_size));
+  const auto& compiled_head_dims = BwdPreprocessMetadata::get_D_HEAD_choices();
+  int head_size_rounded = round_value(head_size, compiled_head_dims);
+  if (head_size_rounded < 0) {
+#if AOTRITON_VERBOSE
+    std::cerr << "Head dimension " << head_size << " unsupported. ";
+    if (compiled_head_dims.empty()) {
+      std::cerr << "No head dimension (BLOCK_DMODEL) compiled into the binary." << std::endl;
+    } else {
+      std::cerr << "Maximal dimesion compiled into the binary is "
+                << compiled_head_dims.back()
+                << std::endl;
+    }
+#endif
+    return hipErrorInvalidValue;
+  }
   // Requires C++ 20
   BwdPreprocessParams params = {
     .Out = &out,
@@ -39,7 +53,7 @@ bwd_preprocess(T4 out, T4 dout, T2 delta, AOTRITON_NS::Stream stream_wrap) {
     .Delta = &delta,
     .seqlen_q = static_cast<int32_t>(out.size(2)),
     .head_dim = head_size,
-    .D_HEAD = bit_ceil(head_size),
+    .D_HEAD = head_size_rounded,
     .PADDED_HEAD = head_size_rounded != head_size,
   };
   BwdPreprocessContext context;
@@ -75,7 +89,21 @@ bwd_preprocess_varlen(T4 out,
   //       Different kernels may have different rules.
   constexpr int kMinHeadDimCompiled = 16;
   int head_size = out.size(3);
-  int head_size_rounded = std::max(kMinHeadDimCompiled, bit_ceil(head_size));
+  const auto& compiled_head_dims = BwdPreprocessVarlenMetadata::get_D_HEAD_choices();
+  int head_size_rounded = round_value(head_size, compiled_head_dims);
+  if (head_size_rounded < 0) {
+#if AOTRITON_VERBOSE
+    std::cerr << "Head dimension " << head_size << " unsupported. ";
+    if (compiled_head_dims.empty()) {
+      std::cerr << "No head dimension (BLOCK_DMODEL) compiled into the binary." << std::endl;
+    } else {
+      std::cerr << "Maximal dimesion compiled into the binary is "
+                << compiled_head_dims.back()
+                << std::endl;
+    }
+#endif
+    return hipErrorInvalidValue;
+  }
   // Requires C++ 20
   BwdPreprocessVarlenParams params = {
     .Out = &out,
@@ -84,7 +112,7 @@ bwd_preprocess_varlen(T4 out,
     .cu_seqlens_q = &cu_seqlens_q,
     .max_seqlen_q = max_seqlen_q,
     .head_dim = head_size,
-    .D_HEAD = bit_ceil(head_size),
+    .D_HEAD = head_size_rounded,
     .PADDED_HEAD = head_size_rounded != head_size,
   };
   BwdPreprocessVarlenContext context;
@@ -137,7 +165,21 @@ bwd_kernel_dk_dv(T4 q,
   int head_size = q.size(3);
   int num_head_q = q.size(1);
   int num_head_k = k.size(1);
-  int head_size_rounded = std::max(kMinHeadDimCompiled, bit_ceil(head_size));
+  const auto& compiled_head_dims = BwdKernelDkDvMetadata::get_BLOCK_DMODEL_choices();
+  int head_size_rounded = round_value(head_size, compiled_head_dims);
+  if (head_size_rounded < 0) {
+#if AOTRITON_VERBOSE
+    std::cerr << "Head dimension " << head_size << " unsupported. ";
+    if (compiled_head_dims.empty()) {
+      std::cerr << "No head dimension (BLOCK_DMODEL) compiled into the binary." << std::endl;
+    } else {
+      std::cerr << "Maximal dimesion compiled into the binary is "
+                << compiled_head_dims.back()
+                << std::endl;
+    }
+#endif
+    return hipErrorInvalidValue;
+  }
   int bias_type = 0;
   if (b) {
     bias_type = 1;
@@ -165,7 +207,7 @@ bwd_kernel_dk_dv(T4 q,
     .dropout_p = dropout_p,
     .philox_seed_ptr = &philox_seed,
     .philox_offset1 = &philox_offset1,
-    .philox_offset2 = static_cast<uint32_t>(philox_offset2),
+    .philox_offset2 = static_cast<uint64_t>(philox_offset2),
     .BLOCK_DMODEL = head_size_rounded,
     .CAUSAL = is_causal,
     .ENABLE_DROPOUT = dropout_p > 0.0,
@@ -189,12 +231,20 @@ bwd_kernel_dk_dv(T4 q,
     extargs->dkdv.total_number_of_kernels = params._total_number_of_kernels;
     extargs->dkdv.selected_kernel_psels = params._preferred_kernel_psels;
     extargs->dkdv.selected_kernel_copts = params._preferred_kernel_copts;
+    context.peek_kernel_image = extargs->dkdv.peek_kernel_image;
   }
 #endif
   if (err != hipSuccess) {
     return err;
   }
   err = context.launch(params, stream);
+#if AOTRITON_BUILD_FOR_TUNING
+  if (extargs && extargs->dkdv.peek_kernel_image) {
+    auto essentials = params.selected_kernel->get_image_info_iff_decompressed();
+    extargs->dkdv.kernel_image = essentials.image;
+    extargs->dkdv.image_size = essentials.size;
+  }
+#endif
   return err;
 }
 
@@ -238,7 +288,21 @@ bwd_kernel_dq(T4 q,
   int head_size = q.size(3);
   int num_head_q = q.size(1);
   int num_head_k = k.size(1);
-  int head_size_rounded = std::max(kMinHeadDimCompiled, bit_ceil(head_size));
+  const auto& compiled_head_dims = BwdKernelDqMetadata::get_BLOCK_DMODEL_choices();
+  int head_size_rounded = round_value(head_size, compiled_head_dims);
+  if (head_size_rounded < 0) {
+#if AOTRITON_VERBOSE
+    std::cerr << "Head dimension " << head_size << " unsupported. ";
+    if (compiled_head_dims.empty()) {
+      std::cerr << "No head dimension (BLOCK_DMODEL) compiled into the binary." << std::endl;
+    } else {
+      std::cerr << "Maximal dimesion compiled into the binary is "
+                << compiled_head_dims.back()
+                << std::endl;
+    }
+#endif
+    return hipErrorInvalidValue;
+  }
   int bias_type = 0;
   if (b) {
     bias_type = 1;
@@ -266,8 +330,8 @@ bwd_kernel_dq(T4 q,
     .dropout_p = dropout_p,
     .philox_seed_ptr = &philox_seed,
     .philox_offset1 = &philox_offset1,
-    .philox_offset2 = static_cast<uint32_t>(philox_offset2),
-    .BLOCK_DMODEL = bit_ceil(head_size),
+    .philox_offset2 = static_cast<uint64_t>(philox_offset2),
+    .BLOCK_DMODEL = head_size_rounded,
     .CAUSAL = is_causal,
     .ENABLE_DROPOUT = dropout_p > 0.0,
     .PADDED_HEAD = head_size_rounded != head_size,
@@ -290,6 +354,7 @@ bwd_kernel_dq(T4 q,
     extargs->dqdb.total_number_of_kernels = params._total_number_of_kernels;
     extargs->dqdb.selected_kernel_psels = params._preferred_kernel_psels;
     extargs->dqdb.selected_kernel_copts = params._preferred_kernel_copts;
+    context.peek_kernel_image = extargs->dqdb.peek_kernel_image;
     // std::cerr << "dqdb lookup_optimal = " << err << " EOL" << std::endl;
   }
 #endif
@@ -297,6 +362,13 @@ bwd_kernel_dq(T4 q,
     return err;
   }
   err = context.launch(params, stream);
+#if AOTRITON_BUILD_FOR_TUNING
+  if (extargs && extargs->dqdb.peek_kernel_image) {
+    auto essentials = params.selected_kernel->get_image_info_iff_decompressed();
+    extargs->dqdb.kernel_image = essentials.image;
+    extargs->dqdb.image_size = essentials.size;
+  }
+#endif
   return err;
 }
 

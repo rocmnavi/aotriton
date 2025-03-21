@@ -37,7 +37,11 @@ hipError_t
                                 const_cast<void*>(static_cast<const void*>(&global_scratch)),
     };
     dim3 grid = grid_calculator(params);
+#if AOTRITON_BUILD_FOR_TUNING
+    return params.selected_kernel->invoke("[[triton_kernel_name]]", grid, args, peek_kernel_image, stream);
+#else
     return params.selected_kernel->invoke("[[triton_kernel_name]]", grid, args, stream);
+#endif
 }
 
 int64_t
@@ -45,6 +49,8 @@ int64_t
     [[get_arch_number_body]];
     return -1;
 }
+
+[[define_compiled_in_features]]
 
 [[context_class_name]]::AutoTuneTableEntry
 [[context_class_name]]::autotune_table[][ [[number_of_functionals]] ] = {

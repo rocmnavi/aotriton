@@ -21,7 +21,7 @@ class TensorHandle:
         '''
             data: numpy array
             dtype: triton type, either pointer_type or scalar_type.
-            we don't store block_type here because the shape information is already availale in the data field
+            we don't store block_type here because the shape information is already available in the data field
             attr: a dictionary of attributes
         '''
         self.data = data
@@ -46,27 +46,26 @@ class TensorHandle:
 
 class BlockPointerHandle:
 
-    def __init__(self, base, shape, strides, offsets, tensor_shape, order):
+    def __init__(self, base, shape, strides, offsets, block_shape, order):
         self.base = base
         self.shape = shape
         self.strides = strides
         self.offsets = offsets
-        self.tensor_shape = tensor_shape
+        self.block_shape = block_shape
         self.order = order
 
     def materialize_pointers(self, boundary_check):
         dtype_tt = self.base.get_element_ty()
         n_bytes = dtype_tt.primitive_bitwidth // 8
-        tensor_shape = self.tensor_shape
-        ptrs = np.broadcast_to(self.base.data, self.tensor_shape)
-        masks = np.ones(self.tensor_shape, dtype=bool)
-        for dim in range(len(tensor_shape)):
-            bcast_dims = [1] * len(tensor_shape)
-            bcast_dims[dim] = tensor_shape[dim]
-            off = (self.offsets[dim].data + np.arange(tensor_shape[dim])).reshape(bcast_dims)
+        ptrs = np.broadcast_to(self.base.data, self.block_shape)
+        masks = np.ones(self.block_shape, dtype=bool)
+        for dim in range(len(self.block_shape)):
+            bcast_dims = [1] * len(self.block_shape)
+            bcast_dims[dim] = self.block_shape[dim]
+            off = (self.offsets[dim].data + np.arange(self.block_shape[dim])).reshape(bcast_dims)
             ptrs = ptrs + (n_bytes * off * self.strides[dim].data).astype(np.uint64)
             if dim in boundary_check:
-                masks = np.logical_and(masks, off < self.shape[dim].data)
+                masks = masks & (off < self.shape[dim].data) & (off >= 0)
         ptrs = TensorHandle(ptrs, self.base.dtype.scalar)
         return ptrs, masks
 
@@ -242,7 +241,7 @@ class InterpreterBuilder:
         self.options = InterpreterOptions()
         self.codegen_fns = {}
         self.codegen_fns["convert_custom_types"] = ExtraFunctions._convert_custom_types
-        self.codegen_fns["min_dot_size"] = lambda lhsType, rhsType: (16, 16, 16)
+        self.codegen_fns["min_dot_size"] = lambda lhsType, rhsType: (1, 1, 1)
 
     def set_grid_idx(self, x, y, z):
         if not x < self.grid_dim[0]:
@@ -557,6 +556,9 @@ class InterpreterBuilder:
     def create_histogram(self, data, bins):
         return TensorHandle(np.histogram(data.data, bins=bins, range=(0, bins))[0], tl.int32)
 
+    def create_gather(self, src, indices, axis):
+        return TensorHandle(np.take_along_axis(src.data, indices.data, axis=axis), src.dtype.scalar)
+
     # pointer arithmetic
 
     def create_addptr(self, ptr, offset):
@@ -655,17 +657,17 @@ class InterpreterBuilder:
         # Triton's barrier applies to each program in a grid, so it's a no-op in the interpreter
         pass
 
-    def create_make_block_ptr(self, base, shape, strides, offsets, tensor_shape, order):
+    def create_make_block_ptr(self, base, shape, strides, offsets, block_shape, order):
         # Create new offsets to avoid modifying the original
         new_offsets = [offset.clone() for offset in offsets]
-        return BlockPointerHandle(base, shape, strides, new_offsets, tensor_shape, order)
+        return BlockPointerHandle(base, shape, strides, new_offsets, block_shape, order)
 
     def create_advance(self, ptr, offsets):
         if len(ptr.offsets) != len(offsets):
             raise ValueError("len(ptr.offsets) != len(offsets)")
         # Create new offsets to avoid modifying the original
         new_offsets = [offset.clone() for offset in ptr.offsets]
-        ret = BlockPointerHandle(ptr.base, ptr.shape, ptr.strides, new_offsets, ptr.tensor_shape, ptr.order)
+        ret = BlockPointerHandle(ptr.base, ptr.shape, ptr.strides, new_offsets, ptr.block_shape, ptr.order)
         for i in range(len(offsets)):
             ret.offsets[i].data += offsets[i].data
         return ret
@@ -727,10 +729,12 @@ class ReduceScanOpIneterface:
             self.check_axis(arg.shape, self.axis)
 
     def to_tensor(self, ret, dtype):
+        np_dtype = _get_np_dtype(dtype)
         if hasattr(ret, "shape") and ret.shape:
+            ret = ret.astype(np_dtype)
             ret_type = tl.block_type(dtype, list(ret.shape))
         else:
-            ret = np.array([ret]).astype(_get_np_dtype(dtype))
+            ret = np.array([ret], dtype=np_dtype)
             ret_type = dtype
         return tl.core.tensor(TensorHandle(ret, dtype.scalar), ret_type)
 
@@ -997,7 +1001,7 @@ def _patch_lang_core(lang):
 
 
 def _patch_lang(fn):
-    langs = [value for _, value in fn.__globals__.items() if value in [tl, tl.core]]
+    langs = [value for _, value in fn.__globals__.items() if inspect.ismodule(value) and value in [tl, tl.core]]
     assert len(langs) >= 1, "triton.language must be visible from within jit'd function"
     for lang in langs:
         _patch_builtin(lang, interpreter_builder)
@@ -1011,7 +1015,7 @@ def _patch_lang(fn):
 # TODO: wrap everything in triton tensors
 def _implicit_cvt(arg):
     if isinstance(arg, int):
-        ty = tl.str_to_ty(triton.runtime.jit.JITFunction._type_of(triton.runtime.jit.JITFunction._key_of(arg)))
+        ty = tl.str_to_ty(triton.runtime.jit.mangle_type(arg))
         dtype = np.int32
         if -2**31 <= arg < 2**31:
             dtype = np.int32
@@ -1026,13 +1030,25 @@ def _implicit_cvt(arg):
         handle = TensorHandle(np.array([arg], dtype=dtype), ty)
         return tl.tensor(handle, ty)
     if hasattr(arg, "data_ptr"):
-        ty = tl.str_to_ty(triton.runtime.jit.JITFunction._type_of(triton.runtime.jit.JITFunction._key_of(arg)))
+        ty = tl.str_to_ty(triton.runtime.jit.mangle_type(arg))
         handle = TensorHandle(np.array([arg.data_ptr()], dtype=np.uint64), ty)
         return tl.tensor(handle, ty)
     return arg
 
 
 interpreter_builder = InterpreterBuilder()
+
+
+def _unwrap_tensor(t):
+    if isinstance(t, triton.runtime.jit.TensorWrapper):
+        return t.base
+    return t
+
+
+def _rewrap_tensor(t, original_tensor):
+    if isinstance(original_tensor, triton.runtime.jit.TensorWrapper):
+        return triton.runtime.jit.TensorWrapper(t, original_tensor.dtype)
+    return t
 
 
 class GridExecutor:
@@ -1047,12 +1063,19 @@ class GridExecutor:
         self.constexprs = [name for name in arg_names if __annotations__.get(name) == "constexpr"]
 
     def _init_args_hst(self, args_dev, kwargs):
-        args_hst = []
-        for arg in args_dev:
-            if hasattr(arg, "data_ptr"):
-                args_hst.append(arg.cpu())
-            else:
-                args_hst.append(arg)
+
+        def _to_cpu(arg):
+            if not hasattr(arg, "data_ptr"):
+                return arg
+            unwrapped_arg = _unwrap_tensor(arg)
+            cpu_arg = unwrapped_arg.new_empty(0, device='cpu')
+            cpu_arg.set_(unwrapped_arg.untyped_storage().cpu(), unwrapped_arg.storage_offset(), unwrapped_arg.size(),
+                         unwrapped_arg.stride())
+            cpu_arg = _rewrap_tensor(cpu_arg, original_tensor=arg)
+            return cpu_arg
+
+        args_hst = [_to_cpu(arg) for arg in args_dev]
+
         # Process keyword arguments
         kwargs_hst = {}
         for key, value in kwargs.items():
@@ -1065,7 +1088,9 @@ class GridExecutor:
     def _restore_args_dev(self, args_dev, args_hst, kwargs, kwargs_hst):
         for arg_dev, arg_hst in zip(args_dev, args_hst):
             if hasattr(arg_dev, "data_ptr"):
-                arg_dev.data.copy_(arg_hst.to(arg_dev.device).data)
+                # No need to rewrap because this just modifies internal
+                arg_dev, arg_hst = _unwrap_tensor(arg_dev), _unwrap_tensor(arg_hst)
+                arg_dev.untyped_storage().copy_(arg_hst.untyped_storage())
 
         # Restore keyword arguments
         for key, kwarg_dev in kwargs.items():

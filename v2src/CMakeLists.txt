@@ -21,6 +21,14 @@ else(AOTRITON_BUILD_FOR_TUNING)
   set(GENERATE_OPTION "")
 endif()
 
+if(AOTRITON_BUILD_FOR_TUNING_BUT_SKIP_KERNEL)
+  if (NOT AOTRITON_BUILD_FOR_TUNING)
+    message(FATAL_ERROR "AOTRITON_BUILD_FOR_TUNING_BUT_SKIP_KERNEL is only relevant with AOTRITON_BUILD_FOR_TUNING=ON")
+  endif()
+  list(APPEND GENERATE_OPTION "--build_for_tuning_but_skip_kernel")
+  list(APPEND GENERATE_OPTION ${AOTRITON_BUILD_FOR_TUNING_BUT_SKIP_KERNEL})
+endif()
+
 if(AOTRITON_NOIMAGE_MODE)
   list(APPEND GENERATE_OPTION "--noimage_mode")
 endif()
@@ -70,6 +78,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
     add_custom_command(OUTPUT "${HSACO}"
       COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR}
       TRITON_CACHE_DIR=${CMAKE_BINARY_DIR}/triton-cache
+      TRITON_F32_DEFAULT="ieee"
       "${VENV_DIR}/bin/python"
       "${AOTRITON_COMPILER}"
       "${SRC}"
@@ -179,6 +188,20 @@ target_link_libraries(aotriton_v2 PRIVATE lzma_interface)
 target_link_libraries(aotriton_v2 PUBLIC hip::host hip::amdhip64)
 set_target_properties(aotriton_v2 PROPERTIES VERSION
   ${AOTRITON_VERSION_MAJOR_INT}.${AOTRITON_VERSION_MINOR_INT}.${AOTRITON_VERSION_PATCH_INT})
+
+execute_process(
+  COMMAND ${CMAKE_COMMAND}
+  -E env VIRTUAL_ENV=${VENV_DIR}
+  "${VENV_DIR}/bin/python" -m v2python.ld_script
+  -o "${AOTRITON_V2_BUILD_DIR}/set_aotriton_version.ld"
+  ${AOTRITON_VERSION_MAJOR_INT}
+  ${AOTRITON_VERSION_MINOR_INT}
+  ${AOTRITON_VERSION_PATCH_INT}
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_PARENT_DIR}"
+  COMMAND_ERROR_IS_FATAL ANY
+)
+target_link_options(aotriton_v2 PRIVATE
+                    -T "${AOTRITON_V2_BUILD_DIR}/set_aotriton_version.ld")
 
 include(GNUInstallDirs)
 message("CMAKE_INSTALL_INCLUDEDIR ${CMAKE_INSTALL_INCLUDEDIR}")

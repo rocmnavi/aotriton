@@ -1,18 +1,21 @@
 #!/usr/bin/env python
-# Copyright © 2023-2024 Advanced Micro Devices, Inc.
+# Copyright © 2023-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
 from collections import namedtuple
+from dataclasses import dataclass
 import copy
 import torch
 import triton
 import triton.language as tl
 from flash import (
     debug_fill_dropout_rng as bare_debug_fill_dropout_rng,
+    debug_simulate_encoded_softmax,
     attn_fwd as bare_attn_fwd,
     bwd_preprocess as bare_bwd_preprocess,
     bwd_kernel_dk_dv as bare_bwd_kernel_dk_dv,
     bwd_kernel_dq as bare_bwd_kernel_dq,
+    bwd_kernel_fuse as bare_bwd_kernel_fuse,
 )
 from tuned_bwd import (
     tuned_bwd_kernel_dk_dv,
@@ -23,14 +26,56 @@ from sized_tuned_bwd import (
     sized_tuned_bwd_kernel_dq,
 )
 
-AttentionExtraArgs = namedtuple('AttentionExtraArgs',
-        ['return_encoded_softmax',
-         'autotune',
-         'return_autotune',
-         'fillnan',
-         'report_best_config',
-         ],
-        defaults=[False, False, False, False, None])
+# Note: we don't use Enum class because accessing the integer requires using
+#       `.value` property, which makes the code verbose.
+class CausalType:
+    NONE = 0
+    TOP_LEFT = 1
+    BOTTOM_RIGHT = 2
+
+class BiasType:
+    NONE = 0
+    MATRIX = 1
+    VECTOR = 2  # CAVEAT: Unsupported in kernel
+
+class PersistentType:
+    AUTOSELECT = -1
+    NONE = 0
+    FIXED = 1
+    DYNAMIC = 2
+
+def factor_head_dim(head_dim, n_pieces=3):
+    ret = [0] * 3
+    Lk = head_dim
+    for i in range(n_pieces):
+        max_po2 = 2 ** (Lk.bit_length() - 1)
+        # Technically Triton now supports all power-of-two, lowering to 1
+        # But PyTorch pads all inputs to multiple of 8.
+        # In addition we do not have the capability to support that many choices
+        max_po2 = max(16, max_po2)
+        ret[i] = max_po2
+        # print(f"\t{i=}: {Lk=} {max_po2=} left: {Lk - max_po2}")
+        Lk -= max_po2
+        if Lk <= 0:
+            break
+    while sum(ret) < head_dim:
+        ret[-1] *= 2
+        ret = sorted(ret, reverse=True)
+    return ret
+
+def get_idropout_p(dropout_p):
+    delta_p = dropout_p - 0.5
+    return int(0xFFFFFFFF * delta_p)
+
+@dataclass
+class AttentionExtraArgs:
+    return_encoded_softmax : bool = False
+    autotune : bool = False
+    return_autotune : bool = False
+    fillnan : bool = False
+    report_best_config : bool = False
+    persistent_type : int = PersistentType.AUTOSELECT
+    is_testing : bool = True
 
 VERBOSE=False
 DEFAULT_PHILOX_SEED = 0x1BF52
@@ -240,39 +285,55 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, b, causal, sm_scale, dropout_p,
                 attn_extra_args=AttentionExtraArgs()):
-        return_encoded_softmax, autotune, return_autotune = attn_extra_args[:3]
+        return_encoded_softmax = attn_extra_args.return_encoded_softmax
+        autotune = attn_extra_args.autotune
+        return_autotune = attn_extra_args.return_autotune
         dtype = q.dtype
         # shape constraints
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
-        head_dim_rounded = 2 ** (Lk - 1).bit_length()
-        head_dim_rounded = max(16, head_dim_rounded)
+        head_dim_factors = factor_head_dim(Lk)
+        head_dim_rounded = sum(head_dim_factors)
         padded_head = head_dim_rounded != Lk
+        # assert not padded_head, f"sum({head_dim_factors=}) = {sum(head_dim_factors)} != {Lk=}"
+        batch = q.shape[0]
         num_head_q = q.shape[1]
         num_head_k = k.shape[1]
         max_seqlen_q = q.shape[2]
         max_seqlen_k = k.shape[2]
         o = torch.empty_like(q)
-        if torch.version.hip is None:
-            BLOCK_M = 128
-            BLOCK_N = 64 if Lk <= 64 else 32
-            num_stages = 4 if Lk <= 64 else 3
-            num_warps = 4 if Lk <= 64 else 8
 
-        grid = lambda META: (
-            triton.cdiv(q.shape[2], META['BLOCK_M']),
-            num_head_q,
-            q.shape[0],
-        )
+        persistent_type = attn_extra_args.persistent_type
+        if persistent_type == PersistentType.AUTOSELECT:
+            persistent_type = PersistentType.NONE if not causal else PersistentType.DYNAMIC
+
         null_tensor = torch.empty((0), device=q.device, dtype=torch.int32)
+        if persistent_type == PersistentType.DYNAMIC:
+            persistent_atomic_counter = torch.zeros([1], device=q.device, dtype=torch.int32)
+        else:
+            persistent_atomic_counter = null_tensor
+
+        if persistent_type == PersistentType.NONE:
+            grid = lambda META: (
+                triton.cdiv(max_seqlen_q, META['BLOCK_M']),
+                num_head_q,
+                batch,
+            )
+            Num_CU = 0
+        else:
+            Num_CU = torch.cuda.get_device_properties(q.device).multi_processor_count
+            grid = lambda META: (min(Num_CU * META['GRID_CU_MULTIP'],
+                                     triton.cdiv(max_seqlen_q, META['BLOCK_M']) * num_head_q * batch), )
         M = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         if attn_extra_args.fillnan:
             for t in (o, M):
                 t.fill_(float('nan'))
         if return_encoded_softmax:
             encoded_softmax = torch.ones((q.shape[0], q.shape[1], q.shape[2], k.shape[2]), device=q.device, dtype=q.dtype)
+            return_encoded_softmax_type = True
         else:
             encoded_softmax = None
+            return_encoded_softmax_type = False
         if False or VERBOSE:
             print(f'{q.shape=}')
             print(f'{k.shape=}')
@@ -291,19 +352,33 @@ class _attention(torch.autograd.Function):
             if encoded_softmax is not None:
                 print(f'{encoded_softmax.shape=} {encoded_softmax.dtype=}')
 
-        philox_seed = torch.tensor([DEFAULT_PHILOX_SEED], device=q.device, dtype=torch.uint64)
-        philox_offset1 = torch.tensor([DEFAULT_PHILOX_OFFSET_1], device=q.device, dtype=torch.uint32)
-        philox_offset2 = DEFAULT_PHILOX_OFFSET_2
-        philox_seed_output = torch.tensor([0], device=q.device, dtype=torch.uint64)
-        philox_offset_output = torch.tensor([0], device=q.device, dtype=torch.uint64)
+        if dropout_p > 0.0:
+            philox_seed = torch.tensor([DEFAULT_PHILOX_SEED], device=q.device, dtype=torch.uint64)
+            philox_offset1 = torch.tensor([DEFAULT_PHILOX_OFFSET_1], device=q.device, dtype=torch.uint64)
+            philox_offset2 = DEFAULT_PHILOX_OFFSET_2
+            philox_seed_output = torch.tensor([0], device=q.device, dtype=torch.uint64)
+            philox_offset_output = torch.tensor([0], device=q.device, dtype=torch.uint64)
+        else:
+            u64nulltensor = torch.empty([0], device=q.device, dtype=torch.uint64)
+            philox_seed = u64nulltensor
+            philox_offset1 = u64nulltensor
+            philox_offset2 = 0
+            philox_seed_output = u64nulltensor
+            philox_offset_output = u64nulltensor
 
         if b is None:
             b = torch.empty((0,0,0,0), device=q.device, dtype=q.dtype)
-            BIAS_TYPE = 0
+            BIAS_TYPE = BiasType.NONE
         else:
-            BIAS_TYPE = 1
+            BIAS_TYPE = BiasType.MATRIX
 
-        use_small_block = dropout_p > 0.0 or BIAS_TYPE != 0 or return_encoded_softmax
+        # TODO alibi_slopes
+        alibi_slopes = torch.empty((0,0), device=q.device, dtype=q.dtype)
+
+        # TODO: int8
+        q_descale = k_descale = p_scale = p_descale = v_descale = 0
+
+        use_small_block = dropout_p > 0.0 or BIAS_TYPE != 0
         use_medium_block = False # reserved
         if use_small_block:
             BLOCK_M = 64
@@ -318,9 +393,8 @@ class _attention(torch.autograd.Function):
             BLOCK_M //= 2
 
         if autotune:
-            assert False, "tritonsrc based autotune is disabled for now due to potentially faulty triton.Config on Navi31"
             tuned_attn_fwd[grid](
-                q, k, v, b, sm_scale, M, o,
+                q, k, v, b, alibi_slopes, sm_scale, M, o,
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
                 v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -340,11 +414,11 @@ class _attention(torch.autograd.Function):
                 philox_offset2=philox_offset2,
                 philox_seed_output=philox_seed_output,
                 philox_offset_output=philox_offset_output,
-                encoded_softmax=encoded_softmax,
+                encoded_softmax=None,
                 CAUSAL=causal,
                 BLOCK_DMODEL=head_dim_rounded,
                 ENABLE_DROPOUT=dropout_p > 0.0,
-                RETURN_ENCODED_SOFTMAX=encoded_softmax is not None,
+                RETURN_ENCODED_SOFTMAX=False,
                 PADDED_HEAD=padded_head,
                 BIAS_TYPE=BIAS_TYPE,
             )
@@ -358,38 +432,78 @@ class _attention(torch.autograd.Function):
             print(f'{q.shape=} {k.shape=} {v.shape=} {b.shape=} {M.shape=} {o.shape=}', flush=True)
             print(f'{q.stride()=} {k.stride()=} {v.stride()=} {b.stride()=} {M.stride()=} {o.stride()=}', flush=True)
             bare_attn_fwd[grid](
-                q, k, v, b, sm_scale, M, o,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                b.stride(0), b.stride(1), b.stride(2), b.stride(3),
-                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-                num_head_q=num_head_q,
-                num_head_k=num_head_k,
+                # Basic SDPA
+                q, k, v, b, alibi_slopes, sm_scale, M, o,
+                q_descale, k_descale, p_scale, p_descale, v_descale,
+                *q.stride(),
+                *k.stride(),
+                *v.stride(),
+                *o.stride(),
+                *b.stride(),
+                *alibi_slopes.stride(),
+                # MQA/GQA
+                Num_head_q=num_head_q,
+                Num_head_k=num_head_k,
+                # Varlen
+                Num_seqlens=0,
                 cu_seqlens_q=null_tensor,
                 cu_seqlens_k=null_tensor,
-                num_seqlens=0,
-                max_seqlen_q=q.shape[2],
-                max_seqlen_k=k.shape[2],
-                head_dim=Lk,
+                Max_seqlen_q=q.shape[2],
+                Max_seqlen_k=k.shape[2],
+                # Head Dimensions
+                BLOCK_DMODEL=head_dim_rounded,
+                Head_dim=Lk,
+                PADDED_HEAD=padded_head,
+                # droput and PRNG
+                ENABLE_DROPOUT=dropout_p > 0.0,
                 dropout_p=dropout_p,
                 philox_seed_ptr=philox_seed,
                 philox_offset1=philox_offset1,
                 philox_offset2=philox_offset2,
                 philox_seed_output=philox_seed_output,
                 philox_offset_output=philox_offset_output,
-                encoded_softmax=encoded_softmax,
-                CAUSAL=causal,
-                BLOCK_M=BLOCK_M,
-                BLOCK_DMODEL=head_dim_rounded,
-                BLOCK_N=BLOCK_N,
-                pre_load_v=False,
-                ENABLE_DROPOUT=dropout_p > 0.0,
-                RETURN_ENCODED_SOFTMAX=encoded_softmax is not None,
-                PADDED_HEAD=padded_head,
+                RETURN_ENCODED_SOFTMAX=False,
+                encoded_softmax=None,
+                # Causal
+                CAUSAL_TYPE=CausalType.TOP_LEFT if causal else CausalType.NONE,
+                # bias
                 BIAS_TYPE=BIAS_TYPE,
+                # INT8
+                INT8=False,
+                INT8_KV=False,
+                USE_P_SCALE=False,
+                # Alibi
+                USE_ALIBI=False,
+                # Persistent related arguments
+                PERSISTENT_TYPE=persistent_type,
+                persistent_atomic_counter=persistent_atomic_counter,
+                Num_CU=Num_CU,
+                GRID_CU_MULTIP=2,
+                Batch=batch,
+                # Performance
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                PRE_LOAD_V=False,
                 num_stages=1,
             )
+        if return_encoded_softmax:
+            grid = lambda META: (
+                triton.cdiv(encoded_softmax.shape[2], META['BLOCK_M']),
+                encoded_softmax.shape[1],
+                encoded_softmax.shape[0],
+            )
+            debug_simulate_encoded_softmax[grid](encoded_softmax,
+                                                 *encoded_softmax.stride(),
+                                                 dropout_p,
+                                                 Num_head_q=encoded_softmax.shape[1],
+                                                 Max_seqlen_q=encoded_softmax.shape[2],
+                                                 Max_seqlen_k=encoded_softmax.shape[3],
+                                                 philox_seed_ptr=philox_seed,
+                                                 philox_offset1=philox_offset1,
+                                                 philox_offset2=philox_offset2,
+                                                 BLOCK_M=32,
+                                                 BLOCK_N=32)
+            print(f'{encoded_softmax=}')
 
         ctx.autotune = autotune
         ctx.return_autotune = return_autotune
@@ -457,6 +571,8 @@ class _attention(torch.autograd.Function):
         if ctx.tuning_result is not None:
             for kernel_name, best in ctx.tuning_result:
                 print(f'{kernel_name=} {best.kwargs=} {best.num_warps=} {best.num_stages=}')
+        if attn_extra_args.is_testing:
+            assert not torch.isnan(M).any()
         return o, encoded_softmax, ctx.tuning_result
 
     @staticmethod
@@ -465,8 +581,8 @@ class _attention(torch.autograd.Function):
         # if q.shape[-1] <= 32:
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv and Lk == ctx.head_dim
-        head_dim_rounded = 2 ** (ctx.head_dim - 1).bit_length()
-        head_dim_rounded = max(16, head_dim_rounded)
+        head_dim_factors = factor_head_dim(Lk)
+        head_dim_rounded = sum(head_dim_factors)
         padded_head = head_dim_rounded != ctx.head_dim
         attn_extra_args = ctx.attn_extra_args
         philox_seed = ctx.philox_seed
@@ -520,8 +636,8 @@ class _attention(torch.autograd.Function):
         use_small_block = ctx.dropout_p > 0.0
         use_medium_block = ctx.bias_type != 0
         # Profiling shows (16, 16) is optimal solution for most bwd configurations
-        BLOCK_M = 16
-        BLOCK_N = 16
+        BLOCK_M = 32
+        BLOCK_N = 32
         # if use_small_block:
         #     # DQ_BLOCK_M = min(max_seqlen_q, BLOCK)
         #     BLOCK_M = 32
@@ -550,7 +666,6 @@ class _attention(torch.autograd.Function):
         print(f'backward {ctx.bias_type=} {ctx.autotune=} {BLOCK_M=} {BLOCK_N=} {stride_dbz=} {stride_dbh=} {stride_dbm=} {stride_dbn=}')
         if k.requires_grad and v.requires_grad:
             if ctx.autotune:
-                assert False
                 tuned_bwd_kernel_dk_dv[grid_dk_dv](
                     q, k, v, b, ctx.sm_scale,
                     o, do,
@@ -582,7 +697,7 @@ class _attention(torch.autograd.Function):
                     BIAS_TYPE=ctx.bias_type,
                 )
                 report = attn_extra_args.report_best_config
-                if report is not None:
+                if report:
                     best = copy.deepcopy(tuned_bwd_kernel_dk_dv.best_config)
                     attn_extra_args.report_best_config('bwd_kernel_dk_dv', best)
                 if return_autotune:
@@ -647,7 +762,7 @@ class _attention(torch.autograd.Function):
                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
                     BLOCK_DMODEL=head_dim_rounded,
                     CAUSAL=ctx.causal,
-                    num_warps=2, waves_per_eu=1,
+                    num_warps=4, waves_per_eu=1,
                     num_stages=1,
                     ENABLE_DROPOUT=ctx.dropout_p > 0.0,
                     PADDED_HEAD=padded_head,
@@ -713,7 +828,7 @@ class _attention(torch.autograd.Function):
                     BIAS_TYPE=ctx.bias_type,
                 )
                 report = attn_extra_args.report_best_config
-                if report is not None:
+                if report:
                     best = copy.deepcopy(tuned_bwd_kernel_dq.best_config)
                     attn_extra_args.report_best_config('bwd_kernel_dq', best)
                 if return_autotune:
@@ -783,6 +898,8 @@ class _attention(torch.autograd.Function):
                     BIAS_TYPE=ctx.bias_type,
                 )
                 print('bare_bwd_kernel_dq Done')
+        if attn_extra_args.is_testing:
+            assert not torch.isnan(delta).any(), f'{delta=}'
         # print(h.asm["ttgir"])
         return dq, dk, dv, None if db.numel() == 0 else db, None, None, None, None, None, None, None
 
@@ -792,8 +909,8 @@ class _attention(torch.autograd.Function):
         # if q.shape[-1] <= 32:
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv and Lk == ctx.head_dim
-        head_dim_rounded = 2 ** (ctx.head_dim - 1).bit_length()
-        head_dim_rounded = max(16, head_dim_rounded)
+        head_dim_factors = factor_head_dim(ctx.head_dim)
+        head_dim_rounded = sum(head_dim_factors)
         padded_head = head_dim_rounded != ctx.head_dim
         attn_extra_args = ctx.attn_extra_args
         philox_seed = ctx.philox_seed
@@ -808,109 +925,83 @@ class _attention(torch.autograd.Function):
             for t in (dq, dk, dv, db, delta):
                 t.fill_(float('nan'))
         null_tensor = torch.empty((0), device=q.device, dtype=torch.int32)
-        batch = q.shape[0]
-        num_head_q = q.shape[1]
-        num_head_k = q.shape[2]
+        num_head_q = int(q.shape[1])
+        num_head_k = int(k.shape[1])
         max_seqlen_q = q.shape[2]
         max_seqlen_k = k.shape[2]
         MAX_BLOCK = 64 if ctx.dropout_p == 0 else 16
+        # BLOCK = min(max_seqlen_q, max_seqlen_k, q.shape[-1], MAX_BLOCK)
+        # BLOCK = BLOCK if is_supported_by_tl_dot(max_seqlen_q) and is_supported_by_tl_dot(max_seqlen_k) else 1
+        if not ctx.autotune:
+            BLOCK = 16 # FIXME: Variable block size
+        else:
+            BLOCK = 128
+        return_autotune = ctx.tuning_result is not None
+        if False or VERBOSE:
+            print(f'{q.shape=} {q.stride()=}')
+            print(f'{k.shape=} {k.stride()=}')
+            print(f'{v.shape=} {v.stride()=}')
+            print(f'{o.shape=} {o.stride()=}')
+            print(f'{dq.shape=} {dq.stride()=}')
+            print(f'{dk.shape=} {dk.stride()=}')
+            print(f'{dv.shape=} {dv.stride()=}')
+            print(f'{do.shape=} {do.stride()=}')
+            print(f'{L=} {L.shape=}')
+            print(f'{delta=}')
+            print(f'{BLOCK=}')
+
+        use_small_block = ctx.dropout_p > 0.0
+        use_medium_block = ctx.bias_type != 0
+        # Profiling shows (16, 16) is optimal solution for most bwd configurations
+        BLOCK_M = 16
+        BLOCK_N = 16
         stride_dbz, stride_dbh, stride_dbm, stride_dbn = db.stride()
         if db.numel() == 0 or not b.requires_grad:
             # Passing all zeros to indicate no elements
             stride_dbz, stride_dbh, stride_dbm, stride_dbn = 0,0,0,0
         else:
             db.fill_(float('nan'))
-        BLOCK = 128
-        grid_prep = (triton.cdiv(do.shape[2], BLOCK), do.shape[1], do.shape[0])
-        bare_bwd_preprocess[grid_prep](
-            o, do, delta,
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-            max_seqlen_q,
-            Lk,
-            BLOCK_M=BLOCK, D_HEAD=head_dim_rounded,
-            PADDED_HEAD=padded_head, # FIXME: irregular head dimension
-        )
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
-        BLK_SLICE_FACTOR = 2
-        # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 16, 16, 16
-        # BLK_SLICE_FACTOR = 1
-        grid = lambda META: (max(triton.cdiv(max_seqlen_k, META['BLOCK_M1']), triton.cdiv(max_seqlen_q, META['BLOCK_M2'])), num_head_q, batch)
-        if ctx.autotune:
-            tuned_attn_bwd[grid](
-                    q, k, v, b, ctx.sm_scale,
-                    o, do,
-                    dk, dv, dq, db,
-                    L, delta,
-                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                    k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                    v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                    b.stride(0), b.stride(1), b.stride(2), b.stride(3),
-                    do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                    dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                    dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-                    stride_dbz, stride_dbh, stride_dbm, stride_dbn,  # db may be empty
-                    num_head_q=num_head_q,
-                    num_head_k=num_head_k,
-                    cu_seqlens_q=null_tensor,
-                    cu_seqlens_k=null_tensor,
-                    num_seqlens=0,
-                    max_seqlen_q=q.shape[2],
-                    max_seqlen_k=k.shape[2],
-                    head_dim=Lk,
-                    dropout_p=ctx.dropout_p,
-                    philox_seed_ptr=philox_seed,
-                    philox_offset1=philox_offset,
-                    philox_offset2=0,
-                    BLOCK_DMODEL=head_dim_rounded,
-                    CAUSAL=ctx.causal,
-                    ENABLE_DROPOUT=ctx.dropout_p > 0.0,
-                    PADDED_HEAD=padded_head,
-                    BIAS_TYPE=ctx.bias_type,
-                    )
-            report = attn_extra_args.report_best_config
-            if report is not None:
-                best = copy.deepcopy(tuned_attn_bwd.best_config)
-                attn_extra_args.report_best_config('attn_bwd', best)
-        else:
-            bare_attn_bwd[grid](
-                    q, k, v, b, ctx.sm_scale,
-                    o, do,
-                    dk, dv, dq, db,
-                    L, delta,
-                    q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                    k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                    v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                    b.stride(0), b.stride(1), b.stride(2), b.stride(3),
-                    do.stride(0), do.stride(1), do.stride(2), do.stride(3),
-                    dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-                    dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-                    dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-                    stride_dbz, stride_dbh, stride_dbm, stride_dbn,  # db may be empty
-                    num_head_q=num_head_q,
-                    num_head_k=num_head_k,
-                    cu_seqlens_q=null_tensor,
-                    cu_seqlens_k=null_tensor,
-                    num_seqlens=0,
-                    max_seqlen_q=q.shape[2],
-                    max_seqlen_k=k.shape[2],
-                    head_dim=Lk,
-                    dropout_p=ctx.dropout_p,
-                    philox_seed_ptr=philox_seed,
-                    philox_offset1=philox_offset,
-                    philox_offset2=0,
-                    BLOCK_DMODEL=head_dim_rounded,
-                    CAUSAL=ctx.causal,
-                    ENABLE_DROPOUT=ctx.dropout_p > 0.0,
-                    PADDED_HEAD=padded_head,
-                    BIAS_TYPE=ctx.bias_type,
-                    BLOCK_M1=BLOCK_M1,
-                    BLOCK_N1=BLOCK_N1,
-                    BLOCK_M2=BLOCK_M2,
-                    BLOCK_N2=BLOCK_N2,
-                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-                    )
+        if k.requires_grad and v.requires_grad and q.requires_grad:
+            if ctx.autotune:
+                assert False
+            else:
+                print('Running bare_bwd_kernel_fuse')
+                grid_fuse = lambda META: (triton.cdiv(max_seqlen_k, META['BLOCK_N']) + triton.cdiv(max_seqlen_q, META['BLOCK_N']) * (num_head_q//num_head_k), num_head_k, q.shape[0])
+                bare_bwd_kernel_fuse[grid_fuse](
+                        q, k, v, b, ctx.sm_scale,
+                        o, do,
+                        dk, dv, dq, db,
+                        L,
+                        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                        b.stride(0), b.stride(1), b.stride(2), b.stride(3),
+                        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+                        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+                        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+                        dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+                        stride_dbz, stride_dbh, stride_dbm, stride_dbn,  # db may be empty
+                        num_head_q=num_head_q,
+                        num_head_k=num_head_k,
+                        cu_seqlens_q=null_tensor,
+                        cu_seqlens_k=null_tensor,
+                        num_seqlens=0,
+                        max_seqlen_q=q.shape[2],
+                        max_seqlen_k=k.shape[2],
+                        head_dim=Lk,
+                        dropout_p=ctx.dropout_p,
+                        philox_seed_ptr=philox_seed,
+                        philox_offset1=philox_offset,
+                        philox_offset2=0,
+                        BLOCK_DMODEL=head_dim_rounded,
+                        CAUSAL=ctx.causal,
+                        ENABLE_DROPOUT=ctx.dropout_p > 0.0,
+                        PADDED_HEAD=padded_head,
+                        BIAS_TYPE=ctx.bias_type,
+                        BLOCK_M=BLOCK_M,
+                        BLOCK_N=BLOCK_N,
+                        )
+                print('bare_bwd_kernel_fuse Done')
         return dq, dk, dv, None if db.numel() == 0 else db, None, None, None, None, None, None, None
 
     backward = backward_split

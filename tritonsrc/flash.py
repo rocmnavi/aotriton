@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Advanced Micro Devices, Inc.
+# Copyright © 2023-2025 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
 """
@@ -20,4 +20,9 @@ import triton.language as tl
 from fwd_kernel import attn_fwd
 from bwd_preprocess import bwd_preprocess, bwd_preprocess_varlen
 from bwd_split_kernel import bwd_kernel_dk_dv, bwd_kernel_dq
-from dropout_rng import debug_fill_dropout_rng, debug_fill_dropout_rng_tensor
+from bwd_kernel_fuse import bwd_kernel_fuse
+from dropout_rng import (
+    debug_fill_dropout_rng,
+    debug_fill_dropout_rng_tensor,
+    debug_simulate_encoded_softmax,
+)

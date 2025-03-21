@@ -11,6 +11,7 @@
 #include <aotriton/runtime.h>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace AOTRITON_NS::v2::[[kernel_family_name]] {
 
@@ -40,11 +41,19 @@ public:
     hipError_t launch(const [[param_class_name]]& params, hipStream_t stream);
     static int64_t get_arch_number(GpuArch arch);
 
+#if AOTRITON_BUILD_FOR_TUNING
+    bool peek_kernel_image = false;
+#endif
 private:
     GpuArch kernel_arch = GPU_ARCH_UNKNOWN;
 
     using AutoTuneTableEntry = std::function<void([[param_class_name]]& params)>;
     static AutoTuneTableEntry autotune_table[][ [[number_of_functionals]] ];
+};
+
+struct [[metadata_class_name]] {
+    // Note: FEAT_CHOICES here
+    [[declare_compiled_in_features]]
 };
 
 namespace autotune {

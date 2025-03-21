@@ -480,11 +480,14 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
 
   int bitwidth = aTensorTy.getElementType().getIntOrFloatBitWidth();
   auto dotOpA = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
-  auto repA = cast<NvidiaMmaEncodingAttr>(dotOpA.getParent())
-                  .getRepForOperand(aShapePerCTA, bitwidth, dotOpA.getOpIdx());
+  int kWidth = dotOpA.getKWidth();
+  auto repA =
+      cast<NvidiaMmaEncodingAttr>(dotOpA.getParent())
+          .getRepForOperand(aShapePerCTA, bitwidth, kWidth, dotOpA.getOpIdx());
   auto dotOpB = cast<DotOperandEncodingAttr>(bTensorTy.getEncoding());
-  auto repB = cast<NvidiaMmaEncodingAttr>(dotOpB.getParent())
-                  .getRepForOperand(bShapePerCTA, bitwidth, dotOpB.getOpIdx());
+  auto repB =
+      cast<NvidiaMmaEncodingAttr>(dotOpB.getParent())
+          .getRepForOperand(bShapePerCTA, bitwidth, kWidth, dotOpB.getOpIdx());
 
   assert(repA[2] == repB[1]);
   assert(repA[0] == repB[0]);
@@ -513,6 +516,9 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
 
   const auto &mmaInstructions =
       isTuring ? mmaInstrPtxTuring : mmaInstrPtxAmpere;
+  if (mmaInstructions.find(mmaType) == mmaInstructions.end()) {
+    return emitError(loc, "Unsupported MMA instruction for the given mma type");
+  }
   auto rank = dTensorTy.getRank();
   auto elemsPerThread = triton::gpu::getElemsPerThread(dTensorTy);
   auto batchOffset =
